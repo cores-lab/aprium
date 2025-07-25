@@ -26,8 +26,8 @@ typedef struct task_queue {
     atomic_size_t next_free;
 } task_queue_t;
 
-static task_queue_t *task_queue_init(size_t size);
-static void task_queue_free(task_queue_t *queue);
+[[maybe_unused]] static task_queue_t *task_queue_init(size_t size);
+[[maybe_unused]] static void task_queue_free(task_queue_t *queue);
 
 static inline task_t *task_queue_get_atomic(task_queue_t *queue);
 static inline void task_queue_add_atomic(task_queue_t *queue, task_t *task);
@@ -35,7 +35,7 @@ static inline void task_queue_add(task_queue_t *queue, task_t *task);
 static inline task_t *task_queue_get_slot_atomic(task_queue_t * queue);
 static inline task_t *task_queue_get_slot(task_queue_t *queue);
 
-task_queue_t *task_queue_init(size_t size) {
+[[maybe_unused]] task_queue_t *task_queue_init(size_t size) {
     task_queue_t *queue = malloc(sizeof(task_queue_t));
     if (!queue) {
         return NULL;
@@ -56,7 +56,7 @@ task_queue_t *task_queue_init(size_t size) {
     return queue;
 }
 
-void task_queue_free(task_queue_t *queue) {
+[[maybe_unused]] void task_queue_free(task_queue_t *queue) {
     pthread_mutex_destroy(&queue->lock);
     free(queue->tasks);
     free(queue);

@@ -17,7 +17,7 @@ static_assert(sizeof(CPU_MAPPING) == sizeof(CPU_MAPPING[0]) * N_CPUS);
 
 /* Join Parameter: */
 #define N_RADIX_BITS 15
-#define N_PASSES 1
+#define N_PASSES 2
 static_assert(N_PASSES <= 2);
 #define N_RADIX_BITS_PASS1 (N_RADIX_BITS / N_PASSES)
 #define N_RADIX_BITS_PASS2 (N_RADIX_BITS - N_RADIX_BITS_PASS1)

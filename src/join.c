@@ -73,7 +73,7 @@ static void print_timing(size_t n_tuples, timing_t *perf)
 #endif
 
 /* join */
-uint64_t rj1p(relation_t *r, relation_t *s);
+uint64_t rj(relation_t *r, relation_t *s);
 
 void *prj_thread(void *args);
 void parallel_radix_partition(part_t * const part);
@@ -82,7 +82,7 @@ void serial_radix_partition(task_t * const task, task_queue_t *queue,
                             uint64_t const radix_bits);
 void radix_partition(relation_t * restrict in, relation_t * restrict out,
                      uint32_t * restrict hist, uint64_t const shift_bits,
-                     uint64_t const radix_bits);
+                     uint64_t const radix_bits, uint64_t const padding_tuples);
 uint64_t bucket_chaining_join(relation_t const * const r,
                               relation_t const * const s);
 
@@ -117,7 +117,7 @@ static inline void barrier_arrive(pthread_barrier_t *barrier) {
 uint64_t join_relations(relation_t *r, relation_t *s,
                         size_t n_threads) {
     (void)n_threads;
-    return rj1p(r, s);
+    return rj(r, s);
 //    uint64_t matches = 0;
 //    pthread_t threads[n_threads];
 //    pthread_attr_t attr;
@@ -507,8 +507,10 @@ serial_radix_partition(task_t * const task,
         exit(EXIT_FAILURE);
     }
 
-    radix_partition(&task->rel_r, &task->tmp_r, hist_r, shift_bits, radix_bits);
-    radix_partition(&task->rel_s, &task->tmp_s, hist_s, shift_bits, radix_bits);
+    radix_partition(&task->rel_r, &task->tmp_r, hist_r, shift_bits, radix_bits,
+                    P_TUPLES);
+    radix_partition(&task->rel_s, &task->tmp_s, hist_s, shift_bits, radix_bits,
+                    P_TUPLES);
 
     for(size_t i = 0; i < fanout; i++) {
         if (hist_r[i] > 0 && hist_s[i] > 0) {
@@ -535,27 +537,29 @@ serial_radix_partition(task_t * const task,
     free(hist_s);
 }
 
-/** 
- * Radix partitioning algorithm (originally described by Manegold et al.) 
+/**
+ * Radix partitioning algorithm (originally described by Manegold et al.).
  * The algorithm mimics the 2-pass radix clustering algorithm from Kim et al.
  * The difference is that it does not compute prefix-sum, instead the sum
  * (offset in the code) is computed iteratively.
  *
- * @warning This method puts padding between partitions.
- *
  * @param in [in] Input relation
- * @param out [out] Result of the partitioning
+ * @param out [out] Output relation (result of the partitioning)
  * @param hist [out] Number of tuples in each partition
  * @param shift_bits [in] Number of lower bits to skip before extracting radix
- *                        bits.
- * @param radix_bits [in] Number of bits to extract to form the partition index.
+ *                        bits of the tuple key.
+ * @param radix_bits [in] Number of bits to extract to form the partition index
+ *                        of the key.
+ * @param radix_bits [in] Number of empty tuples to insert as padding between
+ *                        relations.
  */
-void 
-radix_partition(relation_t * restrict in, 
+void
+radix_partition(relation_t * restrict in,
                 relation_t * restrict out,
-                uint32_t * restrict hist, 
-                uint64_t const shift_bits, 
-                uint64_t const radix_bits)
+                uint32_t * restrict hist,
+                uint64_t const shift_bits,
+                uint64_t const radix_bits,
+                uint64_t const padding_tuples)
 {
     size_t const fanout = 1 << radix_bits;
     uint64_t const mask = (fanout - 1) << shift_bits;
@@ -570,8 +574,7 @@ radix_partition(relation_t * restrict in,
     }
     /* Determine the start and end of each partition depending on the counts */
     for (size_t i = 0; i < fanout; i++) {
-        //dst[i] = offset + i * P_TUPLES;
-        dst[i] = offset;
+        dst[i] = offset + i * padding_tuples;
         offset += hist[i];
     }
 
@@ -584,14 +587,14 @@ radix_partition(relation_t * restrict in,
 }
 
 /**
- * This algorithm builds the hashtable using the bucket chaining algorithm
- * proposed by Manegold et al. Relations R and S typically fit into L2 cache or
- * at least R and |R|*sizeof(int) fits into L2 cache.
+ * This join builds the hashtable using the bucket chaining algorithm proposed
+ * by Manegold et al. Relations R and S typically fit into L2 cache or at least
+ * R and (|R| * sizeof(uint32_t)) fits into L2 cache.
  *
- * @param r input relation R
- * @param s input relation S
+ * @param r [in] Relation R
+ * @param s [in] Relation S
  *
- * @return number of result tuples
+ * @return Number of result tuples
  */
 uint64_t
 bucket_chaining_join(relation_t const * const r,
@@ -637,9 +640,18 @@ bucket_chaining_join(relation_t const * const r,
     return matches;
 }
 
-uint64_t rj1p(relation_t *r, relation_t *s)
+/**
+ * radix join, single threaded
+ *
+ * @param r [in] input relation R
+ * @param s [in] input relation S
+ *
+ * @return number of result tuples
+ */
+uint64_t rj(relation_t *r, relation_t *s)
 {
     uint64_t matches = 0;
+    size_t fanout;
 
 #if PERF
     timing_t perf;
@@ -671,7 +683,7 @@ uint64_t rj1p(relation_t *r, relation_t *s)
     }
 
     /* Allocate histogram space for counts */
-    size_t const fanout = 1 << N_RADIX_BITS;
+    fanout = 1 << N_RADIX_BITS_PASS1;
     uint32_t *hist_r = (uint32_t *) calloc(fanout + 1, sizeof(uint32_t));
     if (hist_r == NULL) {
         perror("calloc");
@@ -689,10 +701,60 @@ uint64_t rj1p(relation_t *r, relation_t *s)
 #endif
 
     /* Partition phase */
-    radix_partition(r, out_r, hist_r, 0, N_RADIX_BITS);
+    /* 1st pass */
+    radix_partition(r, out_r, hist_r, 0, N_RADIX_BITS_PASS1, 0);
+    radix_partition(s, out_s, hist_s, 0, N_RADIX_BITS_PASS1, 0);
+
+#if N_PASSES==1
     r = out_r;
-    radix_partition(s, out_s, hist_s, 0, N_RADIX_BITS);
     s = out_s;
+#elif N_PASSES==2
+    free(hist_r);
+    free(hist_s);
+
+    fanout = 1 << N_RADIX_BITS_PASS2;
+    hist_r = (uint32_t *) calloc(fanout + 1, sizeof(uint32_t));
+    if (hist_r == NULL) {
+        perror("calloc");
+        exit(EXIT_FAILURE);
+    }
+    hist_s = (uint32_t *) calloc(fanout + 1, sizeof(uint32_t));
+    if (hist_s == NULL) {
+        perror("calloc");
+        exit(EXIT_FAILURE);
+    }
+
+    /* 2nd pass */
+    radix_partition(out_r, r, hist_r, N_RADIX_BITS_PASS1, N_RADIX_BITS_PASS2,
+                    0);
+    radix_partition(out_s, s, hist_s, N_RADIX_BITS_PASS1, N_RADIX_BITS_PASS2,
+                    0);
+
+    free(hist_r);
+    free(hist_s);
+
+    fanout = 1 << N_RADIX_BITS;
+    hist_r = (uint32_t *) calloc(fanout, sizeof(uint32_t));
+    if (hist_r == NULL) {
+        perror("calloc");
+        exit(EXIT_FAILURE);
+    }
+    hist_s = (uint32_t *) calloc(fanout, sizeof(uint32_t));
+    if (hist_s == NULL) {
+        perror("calloc");
+        exit(EXIT_FAILURE);
+    }
+
+    /* Count number of tuples per partition */
+    for(size_t i = 0; i < r->n_tuples; i++) {
+        size_t idx = (r->tuples[i].key) & (fanout -1);
+        hist_r[idx]++;
+    }
+    for(size_t i = 0; i < s->n_tuples; i++) {
+        size_t idx = (s->tuples[i].key) & (fanout -1);
+        hist_s[idx]++;
+    }
+#endif
 
 #if PERF
     stop_timer(&(perf.part));

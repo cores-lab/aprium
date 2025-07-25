@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -std=gnu2x -Wall -Wextra -Werror -MMD
+CFLAGS = -std=gnu23 -Wall -Wextra -Werror -MMD -O3
 SRC_DIR = src
 BIN_DIR = bin
 SRC = $(wildcard $(SRC_DIR)/*.c)
