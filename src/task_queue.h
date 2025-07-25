@@ -26,16 +26,16 @@ typedef struct task_queue {
     atomic_size_t next_free;
 } task_queue_t;
 
-task_queue_t *task_queue_init(size_t size);
-void task_queue_free(task_queue_t *queue);
+static task_queue_t *task_queue_init(size_t size);
+static void task_queue_free(task_queue_t *queue);
 
-inline task_t *task_queue_get_atomic(task_queue_t *queue);
-inline void task_queue_add_atomic(task_queue_t *queue, task_t *task);
-inline void task_queue_add(task_queue_t *queue, task_t *task);
-inline task_t *task_queue_get_slot_atomic(task_queue_t * queue);
-inline task_t *task_queue_get_slot(task_queue_t *queue);
+static inline task_t *task_queue_get_atomic(task_queue_t *queue);
+static inline void task_queue_add_atomic(task_queue_t *queue, task_t *task);
+static inline void task_queue_add(task_queue_t *queue, task_t *task);
+static inline task_t *task_queue_get_slot_atomic(task_queue_t * queue);
+static inline task_t *task_queue_get_slot(task_queue_t *queue);
 
-inline task_queue_t *task_queue_init(size_t size) {
+task_queue_t *task_queue_init(size_t size) {
     task_queue_t *queue = malloc(sizeof(task_queue_t));
     if (!queue) {
         return NULL;
@@ -56,13 +56,13 @@ inline task_queue_t *task_queue_init(size_t size) {
     return queue;
 }
 
-inline void task_queue_free(task_queue_t *queue) {
+void task_queue_free(task_queue_t *queue) {
     pthread_mutex_destroy(&queue->lock);
     free(queue->tasks);
     free(queue);
 }
 
-inline task_t *task_queue_get_atomic(task_queue_t *queue) {
+static inline task_t *task_queue_get_atomic(task_queue_t *queue) {
     pthread_mutex_lock(&queue->lock);
     task_t *t = queue->head;
     if (t) {
@@ -72,18 +72,18 @@ inline task_t *task_queue_get_atomic(task_queue_t *queue) {
     return t;
 }
 
-inline void task_queue_add_atomic(task_queue_t *queue, task_t *task) {
+static inline void task_queue_add_atomic(task_queue_t *queue, task_t *task) {
     pthread_mutex_lock(&queue->lock);
     task_queue_add(queue, task);
     pthread_mutex_unlock(&queue->lock);
 }
 
-inline void task_queue_add(task_queue_t *queue, task_t *task) {
+static inline void task_queue_add(task_queue_t *queue, task_t *task) {
     task->next = queue->head;
     queue->head = task;
 }
 
-inline task_t *task_queue_get_slot(task_queue_t *queue) {
+static inline task_t *task_queue_get_slot(task_queue_t *queue) {
     size_t idx = queue->next_free;
     if (idx >= queue->size) {
         return NULL;
@@ -92,7 +92,7 @@ inline task_t *task_queue_get_slot(task_queue_t *queue) {
     return &queue->tasks[idx];
 }
 
-inline task_t *task_queue_get_slot_atomic(task_queue_t *queue) {
+static inline task_t *task_queue_get_slot_atomic(task_queue_t *queue) {
     size_t idx = atomic_fetch_add(&queue->next_free, 1);
     if (idx >= queue->size) {
         return NULL;

@@ -1,11 +1,11 @@
 CC = gcc
-CFLAGS = -std=gnu23 -Wall -Wextra -MMD
+CFLAGS = -std=gnu2x -Wall -Wextra -Werror -MMD
 SRC_DIR = src
 BIN_DIR = bin
 SRC = $(wildcard $(SRC_DIR)/*.c)
 OBJ = $(patsubst $(SRC_DIR)/%.c, $(BIN_DIR)/%.o, $(SRC))
 TARGET = $(BIN_DIR)/prj
-DEP_FILES = $(OBJ:.o=.d)
+DEP = $(OBJ:.o=.d)
 
 .PHONY: all clean $(BIN_DIR)
 
@@ -23,4 +23,4 @@ $(BIN_DIR):
 clean:
 	rm -r $(BIN_DIR)
 
--include $(DEP_FILES)
+-include $(DEP)
