@@ -32,10 +32,7 @@ int main(int argc, char **argv) {
     CPU_ZERO(&set);
     CPU_SET(0, &set);
     int err = sched_setaffinity(0, sizeof(set), &set);
-    if (err) {
-        perror("sched_setaffinity");
-        exit(EXIT_FAILURE);
-    }
+    BUG_ON(err);
 
     /* CLI parameters */
     param_t params;
@@ -97,7 +94,6 @@ void print_help(char **argv) {
         " -s, --s-size        Number of tuples in probe relation S [67108864]\n"
         " -h, --help          Show this message\n"
         " -V, --version       Show version\n"
-        "\n"
     );
 }
 
@@ -128,13 +124,13 @@ void parse_args(int argc, char **argv, param_t *params) {
 
         switch (opt) {
             case 't':
-                params->n_threads = atoi(optarg);
+                params->n_threads = atoll(optarg);
                 break;
             case 'r':
-                params->r_size = atoi(optarg);
+                params->r_size = atoll(optarg);
                 break;
             case 's':
-                params->s_size = atoi(optarg);
+                params->s_size = atoll(optarg);
                 break;
             case '?':
             case 'h':

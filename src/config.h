@@ -2,12 +2,12 @@
 
 #include "types.h"
 
-/* Program: */
+/* Program */
 #define VERSION "0.1.0"
 #define DEBUG 1
 #define PERF 1
 
-/* Hardware: */
+/* Hardware */
 #define N_CPUS 8
 static uint8_t const CPU_MAPPING[] = {0, 1, 2, 3, 4, 5, 6, 7};
 static_assert(sizeof(CPU_MAPPING) == sizeof(CPU_MAPPING[0]) * N_CPUS);
@@ -15,7 +15,7 @@ static_assert(sizeof(CPU_MAPPING) == sizeof(CPU_MAPPING[0]) * N_CPUS);
 #define L1_CACHE_SIZE 49152
 #define L1_ASSOCIATIVITY 12
 
-/* Join Parameter: */
+/* Join Parameter */
 #define N_RADIX_BITS 15
 #define N_PASSES 2
 static_assert(N_PASSES <= 2);
@@ -33,3 +33,12 @@ static_assert(N_PASSES <= 2);
 #define PADDING_TUPLES (P_TUPLES * (FANOUT_PASS2 + 1))
 #define RELATION_PADDING (PADDING_TUPLES * FANOUT_PASS1 * sizeof(tuple_t))
 
+/* Helper */
+#define BUG_ON(cond)                                         \
+    do {                                                     \
+        if (cond) {                                          \
+            fprintf(stderr, "BUG_ON: %s:%d in %s(): `%s`\n", \
+                    __FILE__, __LINE__, __func__, #cond);    \
+        abort();                                             \
+        }                                                    \
+    } while (0)

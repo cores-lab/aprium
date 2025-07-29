@@ -1,7 +1,9 @@
+#include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
 
 #include "generate.h"
+#include "config.h"
 
 static int init_done = 0;
 
@@ -10,7 +12,8 @@ void create_relation(relation_t *relation, size_t size) {
         srand(time(NULL));
         init_done = 1;
     }
-    void *ptr = malloc(size * sizeof(tuple_t));
+    void *ptr = malloc(size * sizeof(tuple_t) + RELATION_PADDING);
+    BUG_ON(!ptr);
     relation->tuples = ptr;
     relation->n_tuples = size;
 
