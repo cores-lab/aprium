@@ -2,6 +2,7 @@
 
 #include <pthread.h>
 #include <sched.h>
+#include <stdbool.h>
 #include <stdio.h>
 
 #include "join.h"
@@ -84,7 +85,7 @@ hash_bit_modulo(uint64_t k, uint64_t mask, uint64_t nbits) {
     return (k & mask) >> nbits;
 }
 
-static inline void barrier_arrive(pthread_barrier_t *barrier) {
+static inline void local_barrier(pthread_barrier_t *barrier) {
     int err = pthread_barrier_wait(barrier);
     BUG_ON(err != 0 && err != PTHREAD_BARRIER_SERIAL_THREAD);
 }
@@ -114,6 +115,9 @@ uint64_t join_relations(relation_t *r, relation_t *s, size_t n_threads) {
  * @return Total number of matching tuple pairs found by the join.
  */
 uint64_t multi_threaded(relation_t *r, relation_t *s, size_t n_threads) {
+#if DEBUG
+    printf("Multi-threaded mode, #threads = %lu\n", n_threads);
+#endif
     uint64_t matches = 0;
 
     /* Threads */
@@ -164,7 +168,7 @@ uint64_t multi_threaded(relation_t *r, relation_t *s, size_t n_threads) {
     size_t slice_r = r->n_tuples / n_threads;
     size_t slice_s = s->n_tuples / n_threads;
     for (size_t i = 0; i < n_threads; i++) {
-        int is_last_thread = (i == (n_threads - 1));
+        bool is_last_thread = (i == (n_threads - 1));
 
         args[i].r.tuples = r->tuples + i * slice_r;
         args[i].r.n_tuples = is_last_thread ? (r->n_tuples - i * slice_r)
@@ -242,7 +246,7 @@ uint64_t multi_threaded(relation_t *r, relation_t *s, size_t n_threads) {
 void *prj_thread(void *arg) {
     arg_t *args = (arg_t *) arg;
     size_t const my_tid = args->my_tid;
-    int const is_coordinator = (my_tid == 0);
+    bool const is_coordinator = (my_tid == 0);
 
     uint64_t *offset_r;
     uint64_t *offset_s;
@@ -260,7 +264,7 @@ void *prj_thread(void *arg) {
     task_queue_t *join_queue = args->join_queue;
 
     /* Wait until each thread is initialized */
-    barrier_arrive(args->barrier);
+    local_barrier(args->barrier);
 
     /* Partition phase */
 #if PERF
@@ -295,7 +299,7 @@ void *prj_thread(void *arg) {
     parallel_radix_partition(&part);
 
     /* Wait until each thread finishes 1st pass */
-    barrier_arrive(args->barrier);
+    local_barrier(args->barrier);
 
     /* Coordinator creates tasks for next step (2nd pass or buildprobe) */
     if (is_coordinator) {
@@ -324,7 +328,7 @@ void *prj_thread(void *arg) {
     }
 
     /* Wait until coordinator adds all tasks */
-    barrier_arrive(args->barrier);
+    local_barrier(args->barrier);
 
 #if N_PASSES==1
     task_queue_t *swap = join_queue;
@@ -336,7 +340,7 @@ void *prj_thread(void *arg) {
     if (is_coordinator) {
         printf("2nd pass: #tasks = %ld\n", part_queue->size);
     }
-    barrier_arrive(args->barrier);
+    local_barrier(args->barrier);
 #endif
     task_t *part_task;
     while ((part_task = task_queue_get_atomic(part_queue))) {
@@ -346,7 +350,7 @@ void *prj_thread(void *arg) {
     }
 
     /* Wait until parallel threads add all join tasks */
-    barrier_arrive(args->barrier);
+    local_barrier(args->barrier);
 #endif
 
     /* Buildprobe phase */
@@ -359,7 +363,7 @@ void *prj_thread(void *arg) {
     if (is_coordinator) {
         printf("Buildprobe: #tasks = %ld\n", join_queue->size);
     }
-    barrier_arrive(args->barrier);
+    local_barrier(args->barrier);
 #endif
 
     uint64_t matches = 0;
@@ -370,7 +374,7 @@ void *prj_thread(void *arg) {
     args->matches = matches;
 
 #if PERF
-    barrier_arrive(args->barrier);
+    local_barrier(args->barrier);
     stop_timer(&args->perf.build_probe);
     args->perf.end = timestamp();
 #endif
@@ -431,7 +435,7 @@ void parallel_radix_partition(part_t *const part) {
     }
 
     /* Wait until other parallel threads compute histogram + prefix sum */
-    barrier_arrive(part->barrier);
+    local_barrier(part->barrier);
 
     /* Determine the start and end of each cluster */
     for (size_t i = 0; i < my_tid; i++) {
@@ -629,6 +633,9 @@ bucket_chaining_join(relation_t const * const r,
  */
 uint64_t single_threaded(relation_t *r, relation_t *s)
 {
+#if DEBUG
+    printf("Single-threaded mode\n");
+#endif
     uint64_t matches = 0;
     size_t fanout;
 
@@ -652,9 +659,9 @@ uint64_t single_threaded(relation_t *r, relation_t *s)
 
     /* Allocate histogram space for counts */
     fanout = 1 << N_RADIX_BITS_PASS1;
-    uint32_t *hist_r = (uint32_t *) calloc(fanout + 1, sizeof(uint32_t));
+    uint32_t *hist_r = (uint32_t *) calloc(fanout, sizeof(uint32_t));
     BUG_ON(!hist_r);
-    uint32_t *hist_s = (uint32_t *) calloc(fanout + 1, sizeof(uint32_t));
+    uint32_t *hist_s = (uint32_t *) calloc(fanout, sizeof(uint32_t));
     BUG_ON(!hist_s);
 
     /* Partition phase */
@@ -675,17 +682,26 @@ uint64_t single_threaded(relation_t *r, relation_t *s)
     free(hist_s);
 
     fanout = 1 << N_RADIX_BITS_PASS2;
-    hist_r = (uint32_t *) calloc(fanout + 1, sizeof(uint32_t));
+    hist_r = (uint32_t *) calloc(fanout, sizeof(uint32_t));
     BUG_ON(!hist_r);
-    hist_s = (uint32_t *) calloc(fanout + 1, sizeof(uint32_t));
+    hist_s = (uint32_t *) calloc(fanout, sizeof(uint32_t));
     BUG_ON(!hist_s);
 
     /* 2nd pass */
-    radix_partition(out_r, r, hist_r, N_RADIX_BITS_PASS1, N_RADIX_BITS_PASS2,
-                    0);
-    radix_partition(out_s, s, hist_s, N_RADIX_BITS_PASS1, N_RADIX_BITS_PASS2,
-                    0);
+    uint64_t shift_bits = N_RADIX_BITS_PASS1;
+    uint64_t radix_bits = N_RADIX_BITS_PASS2;
+    radix_partition(out_r, r, hist_r, shift_bits, radix_bits, 0);
+    radix_partition(out_s, s, hist_s, shift_bits, radix_bits, 0);
+#endif
 
+    /* Buildprobe phase */
+#if PERF
+    stop_timer(&perf.part);
+    start_timer(&perf.build_probe);
+#endif
+
+#if N_PASSES==2
+    /* Count number of tuples per partition */
     free(hist_r);
     free(hist_s);
 
@@ -695,7 +711,6 @@ uint64_t single_threaded(relation_t *r, relation_t *s)
     hist_s = (uint32_t *) calloc(fanout, sizeof(uint32_t));
     BUG_ON(!hist_s);
 
-    /* Count number of tuples per partition */
     for(size_t i = 0; i < r->n_tuples; i++) {
         size_t idx = (r->tuples[i].key) & (fanout -1);
         hist_r[idx]++;
@@ -704,12 +719,6 @@ uint64_t single_threaded(relation_t *r, relation_t *s)
         size_t idx = (s->tuples[i].key) & (fanout -1);
         hist_s[idx]++;
     }
-#endif
-
-    /* Buildprobe phase */
-#if PERF
-    stop_timer(&perf.part);
-    start_timer(&perf.build_probe);
 #endif
 
     relation_t tmp_r;
