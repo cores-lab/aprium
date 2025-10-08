@@ -1,8 +1,9 @@
 CC = gcc
-CFLAGS = -std=gnu23 -Wall -Wextra -Werror -MMD -O3
+CFLAGS = -std=gnu23 -Wall -Wextra -Werror -MMD -O3 -mclflushopt -mclwb -flto
+SRC_FILES = main.c cli.c generate.c join.c cxl.c
 SRC_DIR = src
 BIN_DIR = bin
-SRC = $(wildcard $(SRC_DIR)/*.c)
+SRC = $(patsubst %, $(SRC_DIR)/%, $(SRC_FILES))
 OBJ = $(patsubst $(SRC_DIR)/%.c, $(BIN_DIR)/%.o, $(SRC))
 TARGET = $(BIN_DIR)/prj
 DEP = $(OBJ:.o=.d)

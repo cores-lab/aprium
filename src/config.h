@@ -3,20 +3,25 @@
 #include "types.h"
 
 /* Program */
-#define VERSION "0.1.0"
+#define VERSION "0.1.1"
 #define DEBUG 1
 #define PERF 1
 
 /* Hardware */
 #define N_CPUS 8
+static_assert(N_CPUS >= 2);
 static uint8_t const CPU_MAPPING[] = {0, 1, 2, 3, 4, 5, 6, 7};
 static_assert(sizeof(CPU_MAPPING) == sizeof(CPU_MAPPING[0]) * N_CPUS);
 #define CACHELINE_SIZE 64
 #define L1_CACHE_SIZE 49152
 #define L1_ASSOCIATIVITY 12
 
-/* Join Parameter */
-#define N_RADIX_BITS 15
+/* Distributed */
+#define COORDINATION_NODE 0
+#define COORDINATION_THREAD 0
+
+/* Join */
+#define N_RADIX_BITS 18
 #define N_PASSES 2
 static_assert(N_PASSES <= 2);
 #define N_RADIX_BITS_PASS1 (N_RADIX_BITS / N_PASSES)
@@ -42,3 +47,7 @@ static_assert(N_PASSES <= 2);
         abort();                                             \
         }                                                    \
     } while (0)
+
+static inline size_t round_up(size_t s, size_t a) {
+    return (s + (a - 1)) & ~(a - 1);
+}

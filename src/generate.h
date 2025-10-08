@@ -1,6 +1,7 @@
 #pragma once
 
 #include "types.h"
+#include "cli.h"
 
-void create_relation(relation_t *relation, size_t size);
-void delete_relation(relation_t *relation);
+void get_slices(relation_t *slice_r, relation_t *slice_s, param_t *params);
+void release_slices(relation_t *slice_r, relation_t *slice_s);

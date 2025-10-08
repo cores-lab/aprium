@@ -1,6 +1,6 @@
-#define _GNU_SOURCE
-
 #pragma once
+
+#define _GNU_SOURCE
 
 #include <stdint.h>
 #include <sys/time.h>
@@ -9,24 +9,30 @@
 #warning No supported architecture found -- timers will return junk.
 #endif
 
+// TODO: measure time one machine waits for the other after first part pass
 struct timing {
     uint64_t start;
-    uint64_t end;
-    uint64_t part;
+    uint64_t part_distr;
+    uint64_t part_assign;
+    uint64_t part_local;
     uint64_t build_probe;
+    uint64_t end;
 };
 typedef struct timing timing_t;
 
-static void print_timing(size_t n_tuples, timing_t *perf)
+static void print_timing(size_t n_tuples, timing_t *timing)
 {
-    uint64_t total = perf->end - perf->start;
-    uint64_t part = perf->part;
-    uint64_t build_probe = perf->build_probe;
+    uint64_t total = timing->end - timing->start;
+    uint64_t part_distr = timing->part_distr - timing->start;
+    uint64_t part_assign = timing->part_assign - timing->part_distr;
+    uint64_t part_local = timing->part_local - timing->part_assign;
+    uint64_t build_probe = timing->build_probe - timing->part_local;
     double per_tuple = total / n_tuples;
 
-    printf("n_tuples,total,part,build_probe,per_tuple\n");
-    printf("%lu,%lu,%lu,%lu,%.4lf\n", n_tuples, total, part, build_probe,
-            per_tuple);
+    printf("n_tuples,total,part_distr,part_assign,part_local,build_probe,"
+           "per_tuple\n");
+    printf("%lu,%lu,%lu,%lu,%lu,%lu,%.4lf\n", n_tuples, total, part_distr,
+            part_assign, part_local, build_probe, per_tuple);
 }
 
 static inline uint64_t cpu_cycle_count() {

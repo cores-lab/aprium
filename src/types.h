@@ -11,6 +11,8 @@ struct tuple {
     uint64_t rid;
 };
 
+// TODO: move slice definition here
+
 struct relation {
     tuple_t *tuples;
     size_t n_tuples;

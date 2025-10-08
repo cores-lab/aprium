@@ -6,19 +6,20 @@
 #include <stdlib.h>
 
 #include "types.h"
+#include "slice_list.h"
 
 typedef struct task task_t;
 typedef struct task_queue task_queue_t;
 
 struct task {
-    relation_t r;
-    relation_t tmp_r;
-    relation_t s;
-    relation_t tmp_s;
+    slice_list_t slices_r;
+    size_t r_total_tuples;
+    slice_list_t slices_s;
+    size_t s_total_tuples;
     task_t *next;
 };
 
-typedef struct task_queue {
+struct task_queue {
     pthread_mutex_t lock;
     task_t *head;
     task_t *tasks;
@@ -27,7 +28,7 @@ typedef struct task_queue {
 #if DEBUG
     size_t size;
 #endif
-} task_queue_t;
+};
 
 static task_queue_t *task_queue_init(size_t max_size);
 static void task_queue_free(task_queue_t *queue);
