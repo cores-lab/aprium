@@ -10,6 +10,7 @@
 #include "join.h"
 #include "config.h"
 #include "task_queue.h"
+#include "mem.h"
 #include "cxl.h"
 
 #if PERF
@@ -63,18 +64,16 @@ struct part {
 typedef struct part part_t;
 
 /* join */
-uint64_t single_threaded(relation_t *r, relation_t *s);
-uint64_t multi_threaded(relation_t *r, relation_t *s, size_t n_threads);
 uint64_t distributed(relation_t *r, relation_t *s, param_t *params);
 void *drj_thread(void *args);
 void parallel_radix_partition(part_t * const part);
 void serial_radix_partition(task_t * const task, task_queue_t *queue,
                             uint64_t const shift_bits,
-                            uint64_t const radix_bits);
+                            uint64_t const radix_bits, size_t tid);
 void radix_partition(slice_list_t * restrict in, tuple_t * restrict out,
-                     uint32_t * restrict hist, uint64_t const shift_bits,
-                     uint64_t const radix_bits, uint64_t const padding_tuples);
-uint64_t bucket_chaining_join(task_t *join_task);
+                     uint64_t * restrict hist, uint64_t const shift_bits,
+                     uint64_t const radix_bits, size_t tid);
+uint64_t bucket_chaining_join(task_t *join_task, size_t tid);
 
 
 /* helper */
@@ -90,8 +89,7 @@ static inline uint64_t next_pow2(uint64_t v) {
     return v + 1;
 }
 
-static inline uint64_t
-hash(uint64_t k, uint64_t mask, uint64_t nbits) {
+static inline uint64_t hash(uint64_t k, uint64_t mask, uint64_t nbits) {
     return (k & mask) >> nbits;
 }
 
@@ -153,13 +151,8 @@ uint64_t distributed(relation_t *r, relation_t *s, param_t *params) {
     slice_allocator_init(FANOUT_PASS1 * params->n_nodes + (1 << N_RADIX_BITS));
 
     size_t bytes;
-    bytes = FANOUT_PASS1 * sizeof(uint64_t) * params->n_threads;
-    hist_r = aligned_alloc(CACHELINE_SIZE, bytes);
-    BUG_ON(!hist_r);
-    memset(hist_r, 0, bytes);
-    hist_s = aligned_alloc(CACHELINE_SIZE, bytes);
-    BUG_ON(!hist_s);
-    memset(hist_s, 0, bytes);
+    hist_r = mem_p1_hist_r();
+    hist_s = mem_p1_hist_s();
 
     // TODO: here we assume perfectly symmetrical machines & workloads
     bytes = round_up((FANOUT_PASS1 + 1) * sizeof(uint64_t), CACHELINE_SIZE);
@@ -170,7 +163,7 @@ uint64_t distributed(relation_t *r, relation_t *s, param_t *params) {
     offset_s = cxl_alloc(bytes);
     BUG_ON(!offset_s);
 
-    // TODO: here we assume relation splits equally among nodes
+    // TODO: here we assume uniform relations
     size_t slice;
     slice = params->r_size / params->n_nodes;
     bytes = round_up(slice * sizeof(tuple_t) + RELATION_PADDING, CACHELINE_SIZE);
@@ -246,8 +239,6 @@ uint64_t distributed(relation_t *r, relation_t *s, param_t *params) {
     task_queue_free(part_queue);
     task_queue_free(join_queue);
     slice_allocator_free();
-    free(hist_r);
-    free(hist_s);
     cxl_free(offset_r);
     cxl_free(offset_s);
     cxl_free(tmp_r);
@@ -281,6 +272,7 @@ void *drj_thread(void *arg) {
     /* Partition R */
     part.rel          = args->r;
     part.hist         = args->hist_r;
+    // TODO: terrible naming here args offset is the global one in cxl mem, mem offset is the thread local one in local mem
     part.offset       = args->offset_r;
     part.tmp          = args->tmp_r;
     part.total_tuples = args->r_total_tuples;
@@ -375,9 +367,10 @@ void *drj_thread(void *arg) {
 #endif
     task_t *part_task;
     while ((part_task = task_queue_get_atomic(part_queue))) {
-        uint64_t shift_bits = N_RADIX_BITS_PASS1;
-        uint64_t radix_bits = N_RADIX_BITS_PASS2;
-        serial_radix_partition(part_task, join_queue, shift_bits, radix_bits);
+        uint64_t shift = N_RADIX_BITS_PASS1;
+        uint64_t radix = N_RADIX_BITS_PASS2;
+        size_t tid = args->my_tid;
+        serial_radix_partition(part_task, join_queue, shift, radix, tid);
     }
 
     /* Wait until parallel threads add all join tasks */
@@ -399,7 +392,7 @@ void *drj_thread(void *arg) {
     uint64_t matches = 0;
     task_t *join_task;
     while ((join_task = task_queue_get_atomic(join_queue))) {
-        matches += bucket_chaining_join(join_task);
+        matches += bucket_chaining_join(join_task, args->my_tid);
     }
     args->matches = matches;
 
@@ -419,13 +412,13 @@ void parallel_radix_partition(part_t * const part) {
     uint64_t      * hist         = part->hist;
     tuple_t       * restrict tmp = part->tmp;
 
-    size_t const n_tuples     = part->rel.n_tuples;
-    size_t const total_tuples = part->total_tuples;
-    size_t const my_tid       = part->my_tid;
-    size_t const n_threads    = part->n_threads;
-    size_t const my_nid       = part->my_nid;
+    size_t const n_tuples      = part->rel.n_tuples;
+    size_t const total_tuples  = part->total_tuples;
+    size_t const my_tid        = part->my_tid;
+    size_t const n_threads     = part->n_threads;
+    size_t const my_nid        = part->my_nid;
     size_t const offset_stride = part->offset_stride;
-    size_t const tmp_stride = part->tmp_stride;
+    size_t const tmp_stride    = part->tmp_stride;
 
     bool const is_coordinator_thread = (my_tid == COORDINATION_THREAD);
 
@@ -437,12 +430,11 @@ void parallel_radix_partition(part_t * const part) {
     /* offset: cluster i starts at offset[i] and ends at offset[i+1]-1 */
     /* dst: current write-out position within cluster i stored in dst[i] */
     uint64_t * restrict offset = part->offset;
-    //uint64_t dst[fanout];
-    uint64_t * restrict dst = calloc(fanout, sizeof(uint64_t));
-    BUG_ON(!dst);
+    uint64_t * restrict dst = mem_for(my_tid, fanout * sizeof(uint64_t));
 
     /* Compute local histogram for the assigned slice of rel */
-    uint64_t *my_hist = &hist[my_tid * fanout];
+    size_t stride = round_up(fanout, CACHELINE_SIZE / sizeof(uint64_t));
+    uint64_t *my_hist = &hist[my_tid * stride];
     for (size_t i = 0; i < n_tuples; i++) {
         size_t idx = hash(rel[i].key, mask, ignore_bits);
         my_hist[idx]++;
@@ -461,12 +453,12 @@ void parallel_radix_partition(part_t * const part) {
     /* Determine the start and end of each cluster */
     for (size_t i = 0; i < my_tid; i++) {
         for (size_t j = 0; j < fanout; j++) {
-            dst[j] += hist[(i * fanout) + j];
+            dst[j] += hist[(i * stride) + j];
         }
     }
     for (size_t i = my_tid; i < n_threads; i++) {
         for (size_t j = 1; j < fanout; j++) {
-            dst[j] += hist[(i * fanout) + (j - 1)];
+            dst[j] += hist[(i * stride) + (j - 1)];
         }
     }
     for (size_t i = 0; i < fanout; i++) {
@@ -474,11 +466,9 @@ void parallel_radix_partition(part_t * const part) {
     }
 
     if (is_coordinator_thread) {
-        // TODO: try memcpy here?
+        /* Copy to global hist */
         uint64_t *my_offset = &offset[my_nid * offset_stride];
-        for (size_t i = 0; i < fanout; i++) {
-            my_offset[i] = dst[i];
-        }
+        memcpy(my_offset, dst, fanout * sizeof(dst[0]));
         my_offset[fanout] = total_tuples + fanout * PADDING_TUPLES;
 
         /* Flush */
@@ -490,6 +480,11 @@ void parallel_radix_partition(part_t * const part) {
         //_mm_sfence();
 
     }
+
+    // TODO: partition assignment to machines must happen here
+    //       so that we can know below which tuples to write to CXL mem and
+    //       which to write to local mem
+    // TODO: assignment is static for now; make skew-aware!
 
     /* Copy tuples to their corresponding clusters */
     // TODO: we have the segment approach
@@ -515,35 +510,26 @@ void parallel_radix_partition(part_t * const part) {
         }
         _mm_sfence();
     }
-
-    /* Clean-up */
-    free(dst);
 }
 
 void
 serial_radix_partition(task_t * const task,
                        task_queue_t *queue,
                        uint64_t const shift_bits,
-                       uint64_t const radix_bits)
+                       uint64_t const radix_bits,
+                       size_t tid)
 {
     size_t offset_r = 0;
     size_t offset_s = 0;
     size_t const fanout = 1 << radix_bits;
 
-    // TODO: remove memory allocation from critical path
-    tuple_t *tmp_r = (tuple_t *) malloc(task->r_total_tuples * sizeof(tuple_t) + (FANOUT_PASS2 + 1) * P_BYTES);
-    //BUG_ON(!tmp_r);
-    tuple_t *tmp_s = (tuple_t *) malloc(task->s_total_tuples * sizeof(tuple_t) + (FANOUT_PASS2 + 1) * P_BYTES);
-    //BUG_ON(!tmp_s);
-    uint32_t *hist_r = (uint32_t *) calloc(fanout + 1, sizeof(uint32_t));
-    //BUG_ON(!hist_r);
-    uint32_t *hist_s = (uint32_t *) calloc(fanout + 1, sizeof(uint32_t));
-    //BUG_ON(!hist_s);
+    tuple_t *tmp_r = mem_for(tid, task->r_total_tuples * sizeof(tuple_t) + (FANOUT_PASS2 + 1) * P_BYTES);
+    tuple_t *tmp_s = mem_for(tid, task->s_total_tuples * sizeof(tuple_t) + (FANOUT_PASS2 + 1) * P_BYTES);
+    uint64_t *hist_r = mem_for(tid, (fanout + 1) * sizeof(uint64_t));
+    uint64_t *hist_s = mem_for(tid, (fanout + 1) * sizeof(uint64_t));
 
-    radix_partition(&task->slices_r, tmp_r, hist_r, shift_bits, radix_bits,
-                    P_TUPLES);
-    radix_partition(&task->slices_s, tmp_s, hist_s, shift_bits, radix_bits,
-                    P_TUPLES);
+    radix_partition(&task->slices_r, tmp_r, hist_r, shift_bits, radix_bits, tid);
+    radix_partition(&task->slices_s, tmp_s, hist_s, shift_bits, radix_bits, tid);
 
     for(size_t i = 0; i < fanout; i++) {
         if (hist_r[i] > 0 && hist_s[i] > 0) {
@@ -571,8 +557,6 @@ serial_radix_partition(task_t * const task,
             offset_s += hist_s[i];
         }
     }
-    free(hist_r);
-    free(hist_s);
 }
 
 /**
@@ -595,16 +579,17 @@ serial_radix_partition(task_t * const task,
 void
 radix_partition(slice_list_t * restrict in,
                 tuple_t * restrict out,
-                uint32_t * restrict hist,
+                uint64_t * restrict hist,
                 uint64_t const shift_bits,
                 uint64_t const radix_bits,
-                uint64_t const padding_tuples)
+                size_t tid)
 {
     size_t const fanout = 1 << radix_bits;
     uint64_t const mask = (fanout - 1) << shift_bits;
     size_t offset = 0;
+    uint64_t const padding_tuples = P_TUPLES;
 
-    uint32_t dst[fanout];
+    uint64_t *dst = mem_for(tid, fanout * sizeof(uint64_t));
 
     /* Count tuples per partition */
     slice_t *slice = in->head;
@@ -634,7 +619,7 @@ radix_partition(slice_list_t * restrict in,
 }
 
 uint64_t
-bucket_chaining_join(task_t *task)
+bucket_chaining_join(task_t *task, size_t tid)
 {
     // TODO: we can optimize here if slice list only has one slice!
     uint64_t matches = 0;
@@ -643,12 +628,9 @@ bucket_chaining_join(task_t *task)
     uint64_t n_buckets = next_pow2(n_tuples);
     uint64_t const mask = (n_buckets - 1) << (N_RADIX_BITS);
 
-    uint64_t *key = (uint64_t *)malloc(n_tuples * sizeof(uint64_t));
-    //BUG_ON(!key);
-    uint32_t *next = (uint32_t *)malloc(n_tuples * sizeof(uint32_t));
-    //BUG_ON(!next);
-    uint32_t *bucket = (uint32_t *)calloc(n_buckets, sizeof(uint32_t));
-    //BUG_ON(!bucket);
+    uint64_t *key = mem_for(tid, n_tuples * sizeof(uint64_t));
+    uint64_t *next = mem_for(tid, n_tuples * sizeof(uint64_t));
+    uint64_t *bucket = mem_for(tid, n_buckets * sizeof(uint64_t));
 
     /* Build loop */
     slice_t *slice = task->slices_r.head;
@@ -677,11 +659,6 @@ bucket_chaining_join(task_t *task)
         }
         slice = slice->next;
     }
-
-    /* Clean-up */
-    free(key);
-    free(next);
-    free(bucket);
 
     return matches;
 }

@@ -37,6 +37,8 @@ static_assert(N_PASSES <= 2);
 #define P_TUPLES (P_BYTES / sizeof(tuple_t))
 #define PADDING_TUPLES (P_TUPLES * (FANOUT_PASS2 + 1))
 #define RELATION_PADDING (PADDING_TUPLES * FANOUT_PASS1 * sizeof(tuple_t))
+#define SKEW 0.0
+static_assert(SKEW >= 0 && SKEW <= 1);
 
 /* Helper */
 #define BUG_ON(cond)                                         \

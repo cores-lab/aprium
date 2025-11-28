@@ -49,7 +49,7 @@ void delete_relation(relation_t *rel) {
 void get_slices(relation_t *slice_r, relation_t *slice_s, param_t *params) {
     relation_t r;
     relation_t s;
-    bool is_coordinator_node = (params->my_nid == COORDINATION_NODE);
+    bool const is_coordinator_node = (params->my_nid == COORDINATION_NODE);
 
     /* Init relations R & S */
     r.tuples = cxl_alloc(params->r_size * sizeof(tuple_t));

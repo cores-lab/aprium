@@ -1,6 +1,7 @@
 CC = gcc
 CFLAGS = -std=gnu23 -Wall -Wextra -Werror -MMD -O3 -mclflushopt -mclwb -flto
-SRC_FILES = main.c cli.c generate.c join.c cxl.c
+LDFLAGS = -lm
+SRC_FILES = main.c cli.c generate.c join.c mem.c cxl.c
 SRC_DIR = src
 BIN_DIR = bin
 SRC = $(patsubst %, $(SRC_DIR)/%, $(SRC_FILES))
@@ -13,10 +14,10 @@ DEP = $(OBJ:.o=.d)
 all: $(TARGET)
 
 $(TARGET): $(OBJ) | $(BIN_DIR)
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 $(BIN_DIR)/%.o: $(SRC_DIR)/%.c | $(BIN_DIR)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -c $< -o $@ $(LDFLAGS)
 
 $(BIN_DIR):
 	mkdir -p $(BIN_DIR)

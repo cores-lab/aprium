@@ -7,6 +7,7 @@
 #include "types.h"
 #include "config.h"
 #include "cli.h"
+#include "mem.h"
 #include "cxl.h"
 #include "generate.h"
 #include "join.h"
@@ -21,11 +22,12 @@ int main(int argc, char **argv) {
 
     /* Parse CLI arguments */
     param_t params;
-    init_default_params(&params);
     parse_args(argc, argv, &params);
 
     /* Init */
-    cxl_mem_init(params.cxl_dev, params.my_nid, params.n_nodes);
+    mem_alloc(params.r_size, params.s_size, params.n_threads);
+    cxl_mem_init(params.cxl_dev1_size, params.cxl_dev2_size, params.cxl_offset,
+                 params.my_nid, params.n_nodes);
     relation_t slice_r;
     relation_t slice_s;
     uint64_t res;
@@ -52,6 +54,7 @@ int main(int argc, char **argv) {
 
     /* Clean-up */
     release_slices(&slice_r, &slice_s);
+    mem_free();
 
     return 0;
 }

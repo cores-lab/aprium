@@ -32,77 +32,82 @@ static cxl_barrier_t barrier;
 static size_t my_nid;
 
 /* Init */
-void cxl_mem_init(char *device, size_t nid, size_t n_nodes) {
+void cxl_mem_init(size_t size1, size_t size2, size_t offset, size_t nid,
+                  size_t n_nodes)
+{
     my_nid = nid;
     bool const is_coordinator_node = (my_nid == COORDINATION_NODE);
 
-    (void)device;
+    char *dev1 = "/dev/dax0.0";
+    char *dev2 = "/dev/dax1.0";
 
-    const char *dev1 = "/dev/dax0.0";
-    const char *dev2 = "/dev/dax1.0";
+    /*
+     * daberg301:
+     * - size1:
+     * - size2:
+     * - offset:
+     *
+     * daberg303:
+     * - size1: 242.75 GiB == 260650827776ul
+     * - size2: 141.25 GiB == 151666032640ul
+     * - offset: 0 GiB == 0ul
+     *           -OR-
+     *           256 GiB == 256ul << 30
+     *
+     * daberg304:
+     * - size1: 242.75 GiB == 260650827776ul
+     * - size2: 77.25 GiB == 82934620160ul & ~(align - 1) == 82933972992ul
+     * - offset: 0 GiB == 0ul
+     *           -OR-
+     *           192 GiB == 192ul << 30
+     */
 
-    uint64_t size1 = 0;
-    uint64_t size2 = 0;
-    uint64_t offset_gib = 0;
-
-    if (nid == 0) {
-        size1 = 260650827776ULL;  // 242.75 GiB
-        size2 = 151666032640ULL;  // 141.25 GiB
-        offset_gib = 256ULL;
-    }
-    else if (nid == 1) {
-        size1 = 260650827776ULL;  // 242.75 GiB
-        size2 = 82934620160ULL - 647168ULL;   // 77.25 GiB - minus align to 2MiB
-        offset_gib = 192ULL;
-    }
-
-    const uint64_t total = size1 + size2;
-    const uint64_t dev_align = 2097152ULL; /* 2 MiB */
-    const uint64_t offset_bytes = offset_gib << 30;
+    uint64_t total = size1 + size2;
+    uint64_t align = 2ul * 1024 * 1024; /* 2 MiB */
 
     int fd1 = open(dev1, O_RDWR);
     BUG_ON(fd1 < 0);
     int fd2 = open(dev2, O_RDWR);
     BUG_ON(fd2 < 0);
 
-    size_t reserve_len = total + dev_align;
-    void *reserve = mmap(NULL, reserve_len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    size_t size;
+    int prot;
+    int flags;
+
+    size = total + align;
+    prot = PROT_NONE;
+    flags = MAP_PRIVATE | MAP_ANONYMOUS;
+    void *reserve = mmap(NULL, size, prot, flags, -1, 0);
     BUG_ON(reserve == MAP_FAILED);
 
     uintptr_t rbase = (uintptr_t)reserve;
-    uintptr_t aligned_base = round_up(rbase, dev_align);
+    uintptr_t abase = round_up(rbase, align);
+    BUG_ON(abase + total > rbase + size);
 
-    BUG_ON(aligned_base + total > rbase + reserve_len);
+    size_t prefix = abase - rbase;
+    if (prefix) {
+        munmap((void *)rbase, prefix);
+    }
 
-    size_t prefix = aligned_base - rbase;
-    if (prefix) munmap((void*)rbase, prefix);
+    uintptr_t suffix_addr = abase + total;
+    size_t suffix = (rbase + size) - suffix_addr;
+    if (suffix) {
+        munmap((void *)suffix_addr, suffix);
+    }
 
-    uintptr_t suffix_addr = aligned_base + total;
-    size_t suffix = (rbase + reserve_len) - suffix_addr;
-    if (suffix) munmap((void*)suffix_addr, suffix);
+    prot = PROT_READ | PROT_WRITE;
+    flags = MAP_SHARED | MAP_FIXED;
+    void *mem1 = mmap((void *)abase, size1, prot, flags, fd1, 0);
+    BUG_ON(mem1 == MAP_FAILED);
+    void *mem2 = mmap((void *)(abase + size1), size2, prot, flags, fd2, 0);
+    BUG_ON(mem2 == MAP_FAILED);
 
-    void *base = (void*)aligned_base;
+    close(fd1);
+    close(fd2);
 
-    void *m1 = mmap(base, size1, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd1, 0);
-    BUG_ON(m1 == MAP_FAILED);
+    size = 127ul * 1024 * 1024 * 1024; /* 127 GiB */
+    void *mem_base = (void *)(abase + offset);
 
-    /* Map second device right after the first */
-    void *m2 = mmap((void*)(aligned_base + size1), size2, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd2, 0);
-    BUG_ON(m2 == MAP_FAILED);
-
-    size_t size = 127ul * 1024 * 1024 * 1024;
-    void *mem_base = (void*)(aligned_base + offset_bytes);
-
-    ///* Map CXL memory */
-    //int fd = open(device, O_RDWR);
-    //BUG_ON(fd < 0);
-
-    //size_t size = 128ul * 1024 * 1024 * 1024;
-    //int prot = PROT_READ | PROT_WRITE;
-    //int flags = MAP_SHARED;
-    //void *mem_base = mmap(NULL, size, prot, flags, fd, 0);
-    //BUG_ON(mem_base == MAP_FAILED);
-    //close(fd);
 
 #if DEBUG
     printf("Initializing CXL memory (size = %.3lf MiB, addr = %p): ",
