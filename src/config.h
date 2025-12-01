@@ -53,3 +53,7 @@ static_assert(SKEW >= 0 && SKEW <= 1);
 static inline size_t round_up(size_t s, size_t a) {
     return (s + (a - 1)) & ~(a - 1);
 }
+
+static inline size_t rcl(size_t s) {
+    return round_up(s, CACHELINE_SIZE);
+}

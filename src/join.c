@@ -50,7 +50,9 @@ typedef struct arg arg_t;
 struct part {
     alignas(CACHELINE_SIZE)
     relation_t rel;
-    uint64_t *hist;
+    uint64_t *thist;
+    uint64_t *nhist;
+    uint64_t *ghist;
     uint64_t *offset;
     size_t offset_stride;
     tuple_t *tmp;
@@ -59,11 +61,12 @@ struct part {
     size_t my_tid;
     size_t n_threads;
     size_t my_nid;
+    size_t n_nodes;
     pthread_barrier_t *barrier;
 };
 typedef struct part part_t;
 
-/* join */
+/* Join */
 uint64_t distributed(relation_t *r, relation_t *s, param_t *params);
 void *drj_thread(void *args);
 void parallel_radix_partition(part_t * const part);
@@ -75,8 +78,7 @@ void radix_partition(slice_list_t * restrict in, tuple_t * restrict out,
                      uint64_t const radix_bits, size_t tid);
 uint64_t bucket_chaining_join(task_t *join_task, size_t tid);
 
-
-/* helper */
+/* Helper */
 static inline uint64_t next_pow2(uint64_t v) {
     if (v == 0) return 1;
     v--;
@@ -105,7 +107,7 @@ static inline void global_barrier(size_t my_tid, pthread_barrier_t *barrier) {
     local_barrier(barrier);
 }
 
-/* impl */
+/* Impl */
 uint64_t join_relations(relation_t *r, relation_t *s, param_t *params) {
     uint64_t result;
     result = distributed(r, s, params);
@@ -151,30 +153,22 @@ uint64_t distributed(relation_t *r, relation_t *s, param_t *params) {
     slice_allocator_init(FANOUT_PASS1 * params->n_nodes + (1 << N_RADIX_BITS));
 
     size_t bytes;
-    hist_r = mem_p1_hist_r();
-    hist_s = mem_p1_hist_s();
+    hist_r = mem_p1_thread_hist_r();
+    hist_s = mem_p1_thread_hist_s();
 
     // TODO: here we assume perfectly symmetrical machines & workloads
     bytes = round_up((FANOUT_PASS1 + 1) * sizeof(uint64_t), CACHELINE_SIZE);
     offset_stride = bytes / sizeof(uint64_t);
-    bytes *= params->n_nodes;
-    offset_r = cxl_alloc(bytes);
-    BUG_ON(!offset_r);
-    offset_s = cxl_alloc(bytes);
-    BUG_ON(!offset_s);
+    offset_r = cxl_p1_roffs_r();
+    offset_s = cxl_p1_roffs_s();
 
     // TODO: here we assume uniform relations
     size_t slice;
     slice = params->r_size / params->n_nodes;
     bytes = round_up(slice * sizeof(tuple_t) + RELATION_PADDING, CACHELINE_SIZE);
     tmp_stride = bytes / sizeof(tuple_t);
-    bytes *= params->n_nodes;
-    tmp_r = cxl_alloc(bytes);
-    BUG_ON(!tmp_r);
-    slice = params->s_size / params->n_nodes;
-    bytes = (slice * sizeof(tuple_t) + RELATION_PADDING) * params->n_nodes;
-    tmp_s = cxl_alloc(bytes);
-    BUG_ON(!tmp_s);
+    tmp_r = cxl_p1_tmp_r();
+    tmp_s = cxl_p1_tmp_s();
 
     int err = pthread_barrier_init(&barrier, NULL, params->n_threads);
     BUG_ON(err);
@@ -239,10 +233,6 @@ uint64_t distributed(relation_t *r, relation_t *s, param_t *params) {
     task_queue_free(part_queue);
     task_queue_free(join_queue);
     slice_allocator_free();
-    cxl_free(offset_r);
-    cxl_free(offset_s);
-    cxl_free(tmp_r);
-    cxl_free(tmp_s);
 
     return matches;
 }
@@ -267,12 +257,14 @@ void *drj_thread(void *arg) {
     part.my_tid     = args->my_tid;
     part.n_threads  = args->n_threads;
     part.my_nid     = args->my_nid;
+    part.n_nodes    = args->n_nodes;
     part.barrier    = args->barrier;
 
     /* Partition R */
     part.rel          = args->r;
-    part.hist         = args->hist_r;
-    // TODO: terrible naming here args offset is the global one in cxl mem, mem offset is the thread local one in local mem
+    part.thist         = args->hist_r;
+    part.nhist         = cxl_p1_node_hist_r();
+    part.ghist         = cxl_p1_global_hist_r();
     part.offset       = args->offset_r;
     part.tmp          = args->tmp_r;
     part.total_tuples = args->r_total_tuples;
@@ -281,7 +273,9 @@ void *drj_thread(void *arg) {
 
     /* Partition S */
     part.rel          = args->s;
-    part.hist         = args->hist_s;
+    part.thist         = args->hist_s;
+    part.nhist         = cxl_p1_node_hist_s();
+    part.ghist         = cxl_p1_global_hist_s();
     part.offset       = args->offset_s;
     part.tmp          = args->tmp_s;
     part.total_tuples = args->s_total_tuples;
@@ -409,7 +403,9 @@ void *drj_thread(void *arg) {
 
 void parallel_radix_partition(part_t * const part) {
     tuple_t const * restrict rel = part->rel.tuples;
-    uint64_t      * hist         = part->hist;
+    uint64_t      * thist        = part->thist;
+    uint64_t      * restrict nhist = part->nhist;
+    uint64_t      * restrict ghist = part->ghist;
     tuple_t       * restrict tmp = part->tmp;
 
     size_t const n_tuples      = part->rel.n_tuples;
@@ -417,10 +413,12 @@ void parallel_radix_partition(part_t * const part) {
     size_t const my_tid        = part->my_tid;
     size_t const n_threads     = part->n_threads;
     size_t const my_nid        = part->my_nid;
+    size_t const n_nodes       = part->n_nodes;
     size_t const offset_stride = part->offset_stride;
     size_t const tmp_stride    = part->tmp_stride;
 
     bool const is_coordinator_thread = (my_tid == COORDINATION_THREAD);
+    bool const is_coordinator_node   = (my_tid == COORDINATION_NODE);
 
     uint64_t const ignore_bits = 0;
     uint64_t const radix_bits  = N_RADIX_BITS_PASS1;
@@ -432,19 +430,45 @@ void parallel_radix_partition(part_t * const part) {
     uint64_t * restrict offset = part->offset;
     uint64_t * restrict dst = mem_for(my_tid, fanout * sizeof(uint64_t));
 
-    /* Compute local histogram for the assigned slice of rel */
+    /* Compute thread histogram */
     size_t stride = round_up(fanout, CACHELINE_SIZE / sizeof(uint64_t));
-    uint64_t *my_hist = &hist[my_tid * stride];
+    uint64_t *my_thist = &thist[my_tid * stride];
     for (size_t i = 0; i < n_tuples; i++) {
         size_t idx = hash(rel[i].key, mask, ignore_bits);
-        my_hist[idx]++;
+        my_thist[idx]++;
     }
+
+    //local_barrier(part->barrier);
+
+    ///* Compute node historgram */
+    //// TODO: optimize with vector instr?
+    //if (is_coordinator_thread) {
+    //    for (size_t i = 0; i < n_threads; i++) {
+    //        for (size_t j = 0; j < fanout; j++) {
+    //            nhist[(my_nid * stride) + j] += thist[(i * stride) + j];
+    //        }
+    //    }
+    //}
+
+    //global_barrier(my_tid, part->barrier);
+
+    ///* Compute global histogram */
+    //// TODO: optimize with vector instr?
+    //if (is_coordinator_node && is_coordinator_thread) {
+    //    for (size_t i = 0; i < n_nodes; i++) {
+    //        for (size_t j = 0; j < fanout; j++) {
+    //            ghist[j] += nhist[(i * stride) + j];
+    //        }
+    //    }
+    //}
+
+    //global_barrier(my_tid, part->barrier);
 
     /* Compute local prefix sum on hist */
     size_t sum = 0;
     for (size_t i = 0; i < fanout; i++) {
-        sum += my_hist[i];
-        my_hist[i] = sum;
+        sum += my_thist[i];
+        my_thist[i] = sum;
     }
 
     /* Wait until other parallel threads compute histogram + prefix sum */
@@ -453,12 +477,12 @@ void parallel_radix_partition(part_t * const part) {
     /* Determine the start and end of each cluster */
     for (size_t i = 0; i < my_tid; i++) {
         for (size_t j = 0; j < fanout; j++) {
-            dst[j] += hist[(i * stride) + j];
+            dst[j] += thist[(i * stride) + j];
         }
     }
     for (size_t i = my_tid; i < n_threads; i++) {
         for (size_t j = 1; j < fanout; j++) {
-            dst[j] += hist[(i * stride) + (j - 1)];
+            dst[j] += thist[(i * stride) + (j - 1)];
         }
     }
     for (size_t i = 0; i < fanout; i++) {

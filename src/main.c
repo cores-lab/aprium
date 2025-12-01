@@ -26,8 +26,8 @@ int main(int argc, char **argv) {
 
     /* Init */
     mem_alloc(params.r_size, params.s_size, params.n_threads);
-    cxl_mem_init(params.cxl_dev1_size, params.cxl_dev2_size, params.cxl_offset,
-                 params.my_nid, params.n_nodes);
+    cxl_alloc(params.cxl_dev1_size, params.cxl_dev2_size, params.cxl_offset,
+              params.my_nid, params.n_nodes, params.r_size, params.s_size);
     relation_t slice_r;
     relation_t slice_s;
     uint64_t res;
@@ -55,6 +55,7 @@ int main(int argc, char **argv) {
     /* Clean-up */
     release_slices(&slice_r, &slice_s);
     mem_free();
+    cxl_free();
 
     return 0;
 }

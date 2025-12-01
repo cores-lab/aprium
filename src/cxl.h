@@ -1,11 +1,23 @@
 #pragma once
 
-void cxl_mem_init(size_t dev1, size_t dev2, size_t offset, size_t my_nid,
-                  size_t n_nodes);
+#include <stdint.h>
+
+#include "config.h"
+
+void cxl_alloc(size_t dev1, size_t dev2, size_t offset, size_t my_nid,
+               size_t n_nodes, size_t r_tuples, size_t s_tuples);
+void cxl_free(void);
 
 void cxl_barrier(void);
 
-void *cxl_alloc(size_t size);
-void cxl_free(void *ptr);
-void cxl_alloc_reset(void);
-
+tuple_t *cxl_gen_r(void);
+tuple_t *cxl_gen_s(void);
+uint64_t *cxl_p1_node_hist_r(void);
+uint64_t *cxl_p1_node_hist_s(void);
+uint64_t *cxl_p1_global_hist_r(void);
+uint64_t *cxl_p1_global_hist_s(void);
+//old
+uint64_t *cxl_p1_offs_r(void);
+uint64_t *cxl_p1_offs_s(void);
+tuple_t *cxl_p1_tmp_r(void);
+tuple_t *cxl_p1_tmp_s(void);

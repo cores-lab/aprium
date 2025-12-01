@@ -10,36 +10,42 @@
 #include "cxl.h"
 #include "config.h"
 
-struct cxl_allocator {
+/* n_nodes of cachlines for flags (in each first uint64_t):
+ * one       cacheline  (release flag,  coord  -> worker)
+ * n_nodes-1 cachelines (arrival flags, worker -> coord)
+ */
+struct barrier {
+    uint64_t flag;
+    uint8_t _pad[(CACHELINE_SIZE - sizeof(uint64_t))];
+};
+typedef struct barrier barrier_t;
+
+struct mem {
     void *base;
-    size_t offset;
-    size_t total;
-};
-typedef struct cxl_allocator cxl_allocator_t;
-
-struct cxl_barrier {
+    size_t size;
+    size_t my_nid;
     size_t n_nodes;
-    /* n_nodes of cachlines for flags (in each first uint64_t):
-     * one       cacheline  (release flag,  coord  -> worker)
-     * n_nodes-1 cachelines (arrival flags, worker -> coord)
-     */
-    uint64_t *flags;
+    barrier_t *barrier; /* one barrier per node */
+    tuple_t *gen_r;
+    tuple_t *gen_s;
+    uint64_t *nhist_r;
+    uint64_t *nhist_s;
+    uint64_t *ghist_r;
+    uint64_t *ghist_s;
+    // old
+    uint64_t *roffs_r;
+    uint64_t *roffs_s;
+    tuple_t *tmp_r;
+    tuple_t *tmp_s;
 };
-typedef struct cxl_barrier cxl_barrier_t;
+typedef struct mem mem_t;
 
-static cxl_allocator_t allocator;
-static cxl_barrier_t barrier;
-static size_t my_nid;
+static mem_t mem = { 0 };
 
 /* Init */
-void cxl_mem_init(size_t size1, size_t size2, size_t offset, size_t nid,
-                  size_t n_nodes)
-{
-    my_nid = nid;
-    bool const is_coordinator_node = (my_nid == COORDINATION_NODE);
-
-    char *dev1 = "/dev/dax0.0";
-    char *dev2 = "/dev/dax1.0";
+void *cxl_map(size_t size1, size_t size2, size_t offset) {
+    char const *dev1 = "/dev/dax0.0";
+    char const *dev2 = "/dev/dax1.0";
 
     /*
      * daberg301:
@@ -105,46 +111,101 @@ void cxl_mem_init(size_t size1, size_t size2, size_t offset, size_t nid,
     close(fd1);
     close(fd2);
 
-    size = 127ul * 1024 * 1024 * 1024; /* 127 GiB */
-    void *mem_base = (void *)(abase + offset);
+    mem.base = (void *)(abase);
+    mem.size = total;
 
+    return (void *)(abase + offset);
+}
+
+size_t tmp_size(size_t n_tuples, size_t n_nodes) {
+    size_t tmp = rcl((n_tuples / n_nodes) * sizeof(tuple_t) + RELATION_PADDING);
+    return tmp * n_nodes;
+}
+
+void cxl_alloc(size_t size1, size_t size2, size_t offset, size_t my_nid,
+               size_t n_nodes, size_t r_tuples, size_t s_tuples)
+{
+    bool const is_coordinator_node = (my_nid == COORDINATION_NODE);
+
+    void *base = cxl_map(size1, size2, offset);
+    size_t bytes = 0;
+
+    size_t barrier = n_nodes * sizeof(barrier_t);
+    size_t r_size = rcl(r_tuples * sizeof(tuple_t));
+    size_t s_size = rcl(s_tuples * sizeof(tuple_t));
+    size_t ghist = rcl(FANOUT_PASS1 * sizeof(uint64_t));
+    size_t nhist = ghist * n_nodes;
+    size_t roffs = rcl((FANOUT_PASS1 + 1) * sizeof(uint64_t)) * n_nodes;
+    size_t tmp_r = tmp_size(r_tuples, n_nodes);
+    size_t tmp_s = tmp_size(s_tuples, n_nodes);
+
+    bytes += barrier;
+    bytes += r_size;
+    bytes += s_size;
+    bytes += 2 * nhist;
+    bytes += 2 * ghist;
+    bytes += 2 * roffs;
+    bytes += tmp_r;
+    bytes += tmp_s;
+
+    BUG_ON(bytes > 127ul * 1024 * 1024 * 1024); /* >127 GiB? */
 
 #if DEBUG
     printf("Initializing CXL memory (size = %.3lf MiB, addr = %p): ",
-            size / 1024.0 / 1024.0, mem_base);
+            (double) bytes / 1024.0 / 1024.0, base);
     fflush(stdout);
 #endif
 
     /* Coordinator zeros out CXL memory, all nodes flush caches */
-    uintptr_t ptr = (uintptr_t)mem_base;
     if (is_coordinator_node) {
-        memset((void *)ptr, 0, size);
+        memset(base, 0, bytes);
     }
     else {
-        sleep(1);
+        sleep(2);
     }
-    for (uintptr_t p = ptr; p < ptr + size; p += CACHELINE_SIZE) {
+
+    uintptr_t ptr = (uintptr_t)base;
+    for (uintptr_t p = ptr; p < ptr + bytes; p += CACHELINE_SIZE) {
         _mm_clflushopt((void *)p);
     }
     _mm_sfence();
     //atomic_thread_fence(memory_order_seq_cst);
 
-    /* Init global barrier */
-    size_t barrier_bytes = n_nodes * CACHELINE_SIZE;
-    barrier.n_nodes = n_nodes;
-    barrier.flags = (uint64_t *)(ptr);
-    ptr += barrier_bytes;
-    size -= barrier_bytes;
+    mem.barrier = (barrier_t *)(ptr);
+    ptr += barrier;
+    mem.gen_r = (tuple_t *)ptr;
+    ptr += r_size;
+    mem.gen_s = (tuple_t *)ptr;
+    ptr += s_size;
+    mem.nhist_r = (uint64_t *)ptr;
+    ptr += nhist;
+    mem.nhist_s = (uint64_t *)ptr;
+    ptr += nhist;
+    mem.ghist_r = (uint64_t *)ptr;
+    ptr += ghist;
+    mem.ghist_s = (uint64_t *)ptr;
+    ptr += ghist;
+    mem.roffs_r = (uint64_t *)ptr;
+    ptr += roffs;
+    mem.roffs_s = (uint64_t *)ptr;
+    ptr += roffs;
+    mem.tmp_r = (tuple_t *)ptr;
+    ptr += tmp_r;
+    mem.tmp_s = (tuple_t *)ptr;
+    ptr += tmp_s;
 
-    /* Init allocator */
-    allocator.base = (void *)ptr;
-    allocator.offset = 0;
-    allocator.total = size;
+    mem.my_nid = my_nid;
+    mem.n_nodes = n_nodes;
 
 #if DEBUG
     printf("OK\n");
 #endif
 
+}
+
+void cxl_free(void) {
+    int ret = munmap(mem.base, mem.size);
+    BUG_ON(ret);
 }
 
 /* Barrier */
@@ -160,52 +221,72 @@ static inline uint64_t load_inval(volatile uint64_t *p) {
     return *p;
 }
 
-static inline void cpu_pause(void) {
+static inline void spin(void) {
     asm volatile("pause" ::: "memory");
 }
 
 void cxl_barrier(void) {
-    bool is_coordinator_node = (my_nid == COORDINATION_NODE);
     static uint64_t gen = 1;
-
-    if (is_coordinator_node) {
-        for (size_t i = 1; i < barrier.n_nodes; i++) {
-            uintptr_t arrival = (uintptr_t)barrier.flags + i * CACHELINE_SIZE;
-            while (load_inval((uint64_t *)arrival) != gen) { cpu_pause(); }
+    if (mem.my_nid == COORDINATION_NODE) {
+        for (size_t i = 0; i < mem.n_nodes; i++) {
+            if (i == COORDINATION_NODE) {
+                continue;
+            }
+            while (load_inval(&mem.barrier[i].flag) != gen) {
+                spin();
+            }
         }
-        uintptr_t release = (uintptr_t)barrier.flags;
-        store_flush((uint64_t *)release, gen);
+        store_flush(&mem.barrier[COORDINATION_NODE].flag, gen);
         gen++;
     }
     else {
-        uintptr_t arrival = (uintptr_t)barrier.flags + my_nid * CACHELINE_SIZE;
-        store_flush((uint64_t *)arrival, gen);
-        uintptr_t release = (uintptr_t)barrier.flags;
-        while (load_inval((uint64_t *)release) != gen) { cpu_pause(); }
+        store_flush(&mem.barrier[mem.my_nid].flag, gen);
+        while (load_inval(&mem.barrier[COORDINATION_NODE].flag) != gen) {
+            spin();
+        }
         gen++;
     }
 }
 
-/* Allocator */
-void cxl_alloc_reset(void) {
-    allocator.offset = 0;
+/* Memory */
+tuple_t *cxl_gen_r(void) {
+    return mem.gen_r;
 }
 
-void *cxl_alloc(size_t size) {
-  uintptr_t raw = (uintptr_t)allocator.base + allocator.offset;
-  /* Align all returned pointers to cache line size */
-  uintptr_t aligned = round_up(raw, CACHELINE_SIZE);
-  size_t actual = aligned + size - (uintptr_t)allocator.base;
-
-  if (actual > allocator.total) {
-      return NULL;
-  }
-
-  allocator.offset = actual;
-  return (void *)aligned;
+tuple_t *cxl_gen_s(void) {
+    return mem.gen_s;
 }
 
-void cxl_free(void *ptr) {
-    (void)ptr;
+uint64_t *cxl_p1_node_hist_r(void) {
+    return mem.nhist_r;
+}
+
+uint64_t *cxl_p1_node_hist_s(void) {
+    return mem.nhist_s;
+}
+
+uint64_t *cxl_p1_global_hist_r(void) {
+    return mem.ghist_r;
+}
+
+uint64_t *cxl_p1_global_hist_s(void) {
+    return mem.ghist_s;
+}
+
+//old
+uint64_t *cxl_p1_roffs_r(void) {
+    return mem.roffs_r;
+}
+
+uint64_t *cxl_p1_roffs_s(void) {
+    return mem.roffs_s;
+}
+
+tuple_t *cxl_p1_tmp_r(void) {
+    return mem.tmp_r;
+}
+
+tuple_t *cxl_p1_tmp_s(void) {
+    return mem.tmp_s;
 }
 
