@@ -8,8 +8,6 @@
 #include "config.h"
 #include "cxl.h"
 
-//static int init_done = 0;
-
 void fill_relation(relation_t *rel) {
     for (size_t i = 0; i < rel->n_tuples; i++) {
         rel->tuples[i].key = i;
@@ -27,24 +25,6 @@ void fill_relation(relation_t *rel) {
     }
 }
 
-//void create_relation(relation_t *rel, size_t n_tuples) {
-//    if (!init_done) {
-//        srand(time(NULL));
-//        init_done = 1;
-//    }
-//    size_t bytes = n_tuples * sizeof(tuple_t) + RELATION_PADDING;
-//    void *ptr = aligned_alloc(CACHELINE_SIZE, bytes);
-//    BUG_ON(!ptr);
-//    rel->tuples = ptr;
-//    rel->n_tuples = n_tuples;
-//
-//    fill_relation(rel);
-//}
-//
-//void delete_relation(relation_t *rel) {
-//    free(rel->tuples);
-//}
-
 void get_slices(relation_t *slice_r, relation_t *slice_s, param_t *params) {
     relation_t r;
     relation_t s;
@@ -52,12 +32,8 @@ void get_slices(relation_t *slice_r, relation_t *slice_s, param_t *params) {
 
     /* Init relations R & S */
     r.tuples = cxl_gen_r();
-    //r.tuples = cxl_alloc(params->r_size * sizeof(tuple_t));
-    //BUG_ON(!r.tuples);
     r.n_tuples = params->r_size;
     s.tuples = cxl_gen_s();
-    //s.tuples = cxl_alloc(params->s_size * sizeof(tuple_t));
-    //BUG_ON(!s.tuples);
     s.n_tuples = params->s_size;
 
     if (is_coordinator_node) {
@@ -126,8 +102,6 @@ void get_slices(relation_t *slice_r, relation_t *slice_s, param_t *params) {
     slice_r->n_tuples = my_r_size;
     slice_s->tuples   = my_s_tuples;
     slice_s->n_tuples = my_s_size;
-
-    //cxl_alloc_reset();
 }
 
 void release_slices(relation_t *slice_r, relation_t *slice_s) {

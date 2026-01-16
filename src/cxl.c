@@ -28,15 +28,15 @@ struct mem {
     barrier_t *barrier; /* one barrier per node */
     tuple_t *gen_r;
     tuple_t *gen_s;
-    uint64_t *nhist_r;
-    uint64_t *nhist_s;
-    uint64_t *ghist_r;
-    uint64_t *ghist_s;
+    //uint64_t *node_hist_r;
+    //uint64_t *node_hist_s;
+    //uint64_t *global_hist_r;
+    //uint64_t *global_hist_s;
     // old
-    uint64_t *roffs_r;
-    uint64_t *roffs_s;
-    tuple_t *tmp_r;
-    tuple_t *tmp_s;
+    uint64_t *offs_r;
+    uint64_t *offs_s;
+    tuple_t *remote_tmp_r;
+    tuple_t *remote_tmp_s;
 };
 typedef struct mem mem_t;
 
@@ -69,7 +69,7 @@ void *cxl_map(size_t size1, size_t size2, size_t offset) {
      */
 
     uint64_t total = size1 + size2;
-    uint64_t align = 2ul * 1024 * 1024; /* 2 MiB */
+    uint64_t align = 2ULL * 1024 * 1024; /* 2 MiB */
 
     int fd1 = open(dev1, O_RDWR);
     BUG_ON(fd1 < 0);
@@ -117,7 +117,7 @@ void *cxl_map(size_t size1, size_t size2, size_t offset) {
     return (void *)(abase + offset);
 }
 
-size_t tmp_size(size_t n_tuples, size_t n_nodes) {
+static size_t tmp_size(size_t n_tuples, size_t n_nodes) {
     size_t tmp = rcl((n_tuples / n_nodes) * sizeof(tuple_t) + RELATION_PADDING);
     return tmp * n_nodes;
 }
@@ -133,22 +133,23 @@ void cxl_alloc(size_t size1, size_t size2, size_t offset, size_t my_nid,
     size_t barrier = n_nodes * sizeof(barrier_t);
     size_t r_size = rcl(r_tuples * sizeof(tuple_t));
     size_t s_size = rcl(s_tuples * sizeof(tuple_t));
-    size_t ghist = rcl(FANOUT_PASS1 * sizeof(uint64_t));
-    size_t nhist = ghist * n_nodes;
-    size_t roffs = rcl((FANOUT_PASS1 + 1) * sizeof(uint64_t)) * n_nodes;
+    size_t global_hist = rcl(FANOUT_PASS1 * sizeof(uint64_t));
+    size_t node_hist = global_hist * n_nodes;
+    size_t offs = rcl((FANOUT_PASS1 + 1) * sizeof(uint64_t)) * n_nodes;
     size_t tmp_r = tmp_size(r_tuples, n_nodes);
     size_t tmp_s = tmp_size(s_tuples, n_nodes);
 
     bytes += barrier;
     bytes += r_size;
     bytes += s_size;
-    bytes += 2 * nhist;
-    bytes += 2 * ghist;
-    bytes += 2 * roffs;
+    bytes += 2ULL * node_hist;
+    bytes += 2ULL * global_hist;
+    bytes += 2ULL * offs;
     bytes += tmp_r;
     bytes += tmp_s;
 
-    BUG_ON(bytes > 127ul * 1024 * 1024 * 1024); /* >127 GiB? */
+    BUG_ON(bytes % CACHELINE_SIZE);
+    BUG_ON(bytes > 127ULL * 1024 * 1024 * 1024); /* >127 GiB? */
 
 #if DEBUG
     printf("Initializing CXL memory (size = %.3lf MiB, addr = %p): ",
@@ -177,21 +178,22 @@ void cxl_alloc(size_t size1, size_t size2, size_t offset, size_t my_nid,
     ptr += r_size;
     mem.gen_s = (tuple_t *)ptr;
     ptr += s_size;
-    mem.nhist_r = (uint64_t *)ptr;
-    ptr += nhist;
-    mem.nhist_s = (uint64_t *)ptr;
-    ptr += nhist;
-    mem.ghist_r = (uint64_t *)ptr;
-    ptr += ghist;
-    mem.ghist_s = (uint64_t *)ptr;
-    ptr += ghist;
-    mem.roffs_r = (uint64_t *)ptr;
-    ptr += roffs;
-    mem.roffs_s = (uint64_t *)ptr;
-    ptr += roffs;
-    mem.tmp_r = (tuple_t *)ptr;
+    //mem.node_hist_r = (uint64_t *)ptr;
+    //ptr += node_hist;
+    //mem.node_hist_s = (uint64_t *)ptr;
+    //ptr += node_hist;
+    //mem.global_hist_r = (uint64_t *)ptr;
+    //ptr += global_hist;
+    //mem.global_hist_s = (uint64_t *)ptr;
+    //ptr += global_hist;
+    // TODO: offs should be global_offs, if needed at all?
+    mem.offs_r = (uint64_t *)ptr;
+    ptr += offs;
+    mem.offs_s = (uint64_t *)ptr;
+    ptr += offs;
+    mem.remote_tmp_r = (tuple_t *)ptr;
     ptr += tmp_r;
-    mem.tmp_s = (tuple_t *)ptr;
+    mem.remote_tmp_s = (tuple_t *)ptr;
     ptr += tmp_s;
 
     mem.my_nid = my_nid;
@@ -257,36 +259,36 @@ tuple_t *cxl_gen_s(void) {
     return mem.gen_s;
 }
 
-uint64_t *cxl_p1_node_hist_r(void) {
-    return mem.nhist_r;
-}
-
-uint64_t *cxl_p1_node_hist_s(void) {
-    return mem.nhist_s;
-}
-
-uint64_t *cxl_p1_global_hist_r(void) {
-    return mem.ghist_r;
-}
-
-uint64_t *cxl_p1_global_hist_s(void) {
-    return mem.ghist_s;
-}
+//uint64_t *cxl_p1_node_hist_r(void) {
+//    return mem.node_hist_r;
+//}
+//
+//uint64_t *cxl_p1_node_hist_s(void) {
+//    return mem.node_hist_s;
+//}
+//
+//uint64_t *cxl_p1_global_hist_r(void) {
+//    return mem.global_hist_r;
+//}
+//
+//uint64_t *cxl_p1_global_hist_s(void) {
+//    return mem.global_hist_s;
+//}
 
 //old
-uint64_t *cxl_p1_roffs_r(void) {
-    return mem.roffs_r;
+uint64_t *cxl_p1_remote_offs_r(void) {
+    return mem.offs_r;
 }
 
-uint64_t *cxl_p1_roffs_s(void) {
-    return mem.roffs_s;
+uint64_t *cxl_p1_remote_offs_s(void) {
+    return mem.offs_s;
 }
 
-tuple_t *cxl_p1_tmp_r(void) {
-    return mem.tmp_r;
+tuple_t *cxl_p1_remote_tmp_r(void) {
+    return mem.remote_tmp_r;
 }
 
-tuple_t *cxl_p1_tmp_s(void) {
-    return mem.tmp_s;
+tuple_t *cxl_p1_remote_tmp_s(void) {
+    return mem.remote_tmp_s;
 }
 

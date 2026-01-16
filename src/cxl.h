@@ -12,12 +12,12 @@ void cxl_barrier(void);
 
 tuple_t *cxl_gen_r(void);
 tuple_t *cxl_gen_s(void);
-uint64_t *cxl_p1_node_hist_r(void);
-uint64_t *cxl_p1_node_hist_s(void);
-uint64_t *cxl_p1_global_hist_r(void);
-uint64_t *cxl_p1_global_hist_s(void);
+//uint64_t *cxl_p1_node_hist_r(void);
+//uint64_t *cxl_p1_node_hist_s(void);
+//uint64_t *cxl_p1_global_hist_r(void);
+//uint64_t *cxl_p1_global_hist_s(void);
 //old
-uint64_t *cxl_p1_offs_r(void);
-uint64_t *cxl_p1_offs_s(void);
-tuple_t *cxl_p1_tmp_r(void);
-tuple_t *cxl_p1_tmp_s(void);
+uint64_t *cxl_p1_remote_offs_r(void);
+uint64_t *cxl_p1_remote_offs_s(void);
+tuple_t *cxl_p1_remote_tmp_r(void);
+tuple_t *cxl_p1_remote_tmp_s(void);

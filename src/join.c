@@ -50,12 +50,14 @@ typedef struct arg arg_t;
 struct part {
     alignas(CACHELINE_SIZE)
     relation_t rel;
-    uint64_t *thist;
-    uint64_t *nhist;
-    uint64_t *ghist;
-    uint64_t *offset;
+    uint64_t *thread_hist;
+    uint64_t *node_hist;
+    uint64_t *global_hist;
+    uint64_t *local_offs;
+    uint64_t *remote_offs;
     size_t offset_stride;
-    tuple_t *tmp;
+    tuple_t *local_tmp;
+    tuple_t *remote_tmp;
     size_t tmp_stride;
     size_t total_tuples;
     size_t my_tid;
@@ -105,6 +107,11 @@ static inline void global_barrier(size_t my_tid, pthread_barrier_t *barrier) {
         cxl_barrier();
     }
     local_barrier(barrier);
+}
+
+// TODO: this assumes uniform relations
+static inline size_t node_part_assign(size_t p) {
+    return p % 2;
 }
 
 /* Impl */
@@ -159,16 +166,16 @@ uint64_t distributed(relation_t *r, relation_t *s, param_t *params) {
     // TODO: here we assume perfectly symmetrical machines & workloads
     bytes = round_up((FANOUT_PASS1 + 1) * sizeof(uint64_t), CACHELINE_SIZE);
     offset_stride = bytes / sizeof(uint64_t);
-    offset_r = cxl_p1_roffs_r();
-    offset_s = cxl_p1_roffs_s();
+    offset_r = cxl_p1_remote_offs_r();
+    offset_s = cxl_p1_remote_offs_s();
 
     // TODO: here we assume uniform relations
     size_t slice;
     slice = params->r_size / params->n_nodes;
     bytes = round_up(slice * sizeof(tuple_t) + RELATION_PADDING, CACHELINE_SIZE);
     tmp_stride = bytes / sizeof(tuple_t);
-    tmp_r = cxl_p1_tmp_r();
-    tmp_s = cxl_p1_tmp_s();
+    tmp_r = cxl_p1_remote_tmp_r();
+    tmp_s = cxl_p1_remote_tmp_s();
 
     int err = pthread_barrier_init(&barrier, NULL, params->n_threads);
     BUG_ON(err);
@@ -179,7 +186,7 @@ uint64_t distributed(relation_t *r, relation_t *s, param_t *params) {
     size_t s_slice = s->n_tuples / params->n_threads;
 
     for (size_t i = 0; i < params->n_threads; i++) {
-        bool last = (i == params->n_threads);
+        bool last = (i == params->n_threads - 1);
 
         args[i].r.tuples = r->tuples + i * r_slice;
         args[i].r.n_tuples = last ? (r->n_tuples - i * r_slice) : r_slice;
@@ -262,22 +269,26 @@ void *drj_thread(void *arg) {
 
     /* Partition R */
     part.rel          = args->r;
-    part.thist         = args->hist_r;
-    part.nhist         = cxl_p1_node_hist_r();
-    part.ghist         = cxl_p1_global_hist_r();
-    part.offset       = args->offset_r;
-    part.tmp          = args->tmp_r;
+    part.thread_hist         = mem_p1_thread_hist_r();
+    //part.node_hist         = cxl_p1_node_hist_r();
+    //part.global_hist         = cxl_p1_global_hist_r();
+    part.local_offs       = mem_p1_local_offs_r();
+    part.remote_offs       = cxl_p1_remote_offs_r();
+    part.local_tmp          = mem_p1_local_tmp_r();
+    part.remote_tmp          = cxl_p1_remote_tmp_r();
     part.total_tuples = args->r_total_tuples;
 
     parallel_radix_partition(&part);
 
     /* Partition S */
     part.rel          = args->s;
-    part.thist         = args->hist_s;
-    part.nhist         = cxl_p1_node_hist_s();
-    part.ghist         = cxl_p1_global_hist_s();
-    part.offset       = args->offset_s;
-    part.tmp          = args->tmp_s;
+    part.thread_hist         = mem_p1_thread_hist_s();
+    //part.node_hist         = cxl_p1_node_hist_s();
+    //part.global_hist         = cxl_p1_global_hist_s();
+    part.local_offs       = mem_p1_local_offs_s();
+    part.remote_offs       = cxl_p1_remote_offs_s();
+    part.local_tmp          = mem_p1_local_tmp_s();
+    part.remote_tmp          = cxl_p1_remote_tmp_s();
     part.total_tuples = args->s_total_tuples;
 
     parallel_radix_partition(&part);
@@ -289,57 +300,132 @@ void *drj_thread(void *arg) {
 
     // partition assignment
     if (is_coordinator_thread) {
-        bool last_node = ((args->my_nid + 1) == args->n_nodes);
-        size_t slice = FANOUT_PASS1 / args->n_nodes;
-        size_t start = args->my_nid * slice;
-        size_t end = last_node ? FANOUT_PASS1 : (args->my_nid + 1) * slice;
-
-        for (size_t i = start; i < end; i++) {
-            size_t r_count = 0;
-            size_t s_count = 0;
-
-            for (size_t j = 0; j < args->n_nodes; j++) {
-                uint64_t *offset;
-                offset = &args->offset_r[j * args->offset_stride];
-                r_count += offset[i + 1] - offset[i] - PADDING_TUPLES;
-                offset = &args->offset_s[j * args->offset_stride];
-                s_count += offset[i + 1] - offset[i] - PADDING_TUPLES;
+        size_t idx = 0;
+        for (size_t p = 0; p < FANOUT_PASS1; p++) {
+            if (node_part_assign(p) != args->my_nid) {
+                continue;
             }
 
+            uint64_t *local_offset_r = mem_p1_local_offs_r();
+            uint64_t *remote_offset_r = &cxl_p1_remote_offs_r()[((args->my_nid + 1) % 2) * args->offset_stride];
+            uint64_t *local_offset_s = mem_p1_local_offs_s();
+            uint64_t *remote_offset_s = &cxl_p1_remote_offs_s()[((args->my_nid + 1) % 2) * args->offset_stride];
+
+            size_t r_local, r_remote, s_local, s_remote;
+
+            //size_t r_count = 0;
+            r_local = local_offset_r[idx + 1] - local_offset_r[idx] - PADDING_TUPLES;
+            r_remote = remote_offset_r[idx + 1] - remote_offset_r[idx] - PADDING_TUPLES;
+            //size_t s_count = 0;
+            s_local = local_offset_s[idx + 1] - local_offset_s[idx] - PADDING_TUPLES;
+            s_remote = remote_offset_s[idx + 1] - remote_offset_s[idx] - PADDING_TUPLES;
+
+            size_t r_count = r_local + r_remote;
+            size_t s_count = s_local + s_remote;
+
+            //printf("p-%03ld: r = %03ld + %03ld,\ts = %03ld + %03ld\n", p, r_local, r_remote, s_local, s_remote);
 
             if (r_count == 0 || s_count == 0) {
                 continue;
             }
 
             task_t *task = task_queue_get_slot(part_queue);
-            //BUG_ON(!task);
+            BUG_ON(!task);
 
-            for (size_t j = 0; j < args->n_nodes; j++) {
-                slice_t *slice;
-                uint64_t *offset;
-                tuple_t *tmp;
+            slice_t *slice;
+            uint64_t *offset;
+            tuple_t *tmp;
 
-                slice = slice_alloc();
-                //BUG_ON(!slice);
-                offset = &args->offset_r[j * args->offset_stride];
-                tmp = &args->tmp_r[j * args->tmp_stride];
-                slice->tuples = &tmp[offset[i]];
-                slice->n_tuples = offset[i + 1] - offset[i] - PADDING_TUPLES;
-                slice_list_add(&task->slices_r, slice);
+            slice = slice_alloc();
+            BUG_ON(!slice);
+            offset = local_offset_r;
+            tmp = mem_p1_local_tmp_r();
+            slice->tuples = &tmp[offset[idx]];
+            slice->n_tuples = offset[idx + 1] - offset[idx] - PADDING_TUPLES;
+            slice_list_add(&task->slices_r, slice);
 
-                slice = slice_alloc();
-                //BUG_ON(!slice);
-                offset = &args->offset_s[j * args->offset_stride];
-                tmp = &args->tmp_s[j * args->tmp_stride];
-                slice->tuples = &tmp[offset[i]];
-                slice->n_tuples = offset[i + 1] - offset[i] - PADDING_TUPLES;
-                slice_list_add(&task->slices_s, slice);
-            }
+            slice = slice_alloc();
+            BUG_ON(!slice);
+            offset = local_offset_s;
+            tmp = mem_p1_local_tmp_s();
+            slice->tuples = &tmp[offset[idx]];
+            slice->n_tuples = offset[idx + 1] - offset[idx] - PADDING_TUPLES;
+            slice_list_add(&task->slices_s, slice);
+
+            slice = slice_alloc();
+            BUG_ON(!slice);
+            offset = remote_offset_r;
+            tmp = &cxl_p1_remote_tmp_r()[((args->my_nid + 1) % 2) * args->tmp_stride];
+            slice->tuples = &tmp[offset[idx]];
+            slice->n_tuples = offset[idx + 1] - offset[idx] - PADDING_TUPLES;
+            slice_list_add(&task->slices_r, slice);
+
+            slice = slice_alloc();
+            BUG_ON(!slice);
+            offset = remote_offset_s;
+            tmp = &cxl_p1_remote_tmp_s()[((args->my_nid + 1) % 2) * args->tmp_stride];
+            slice->tuples = &tmp[offset[idx]];
+            slice->n_tuples = offset[idx + 1] - offset[idx] - PADDING_TUPLES;
+            slice_list_add(&task->slices_s, slice);
 
             task->r_total_tuples = r_count;
             task->s_total_tuples = s_count;
             task_queue_add(part_queue, task);
+
+            idx++;
         }
+
+        //bool last_node = ((args->my_nid + 1) == args->n_nodes);
+        //size_t slice = FANOUT_PASS1 / args->n_nodes;
+        //size_t start = args->my_nid * slice;
+        //size_t end = last_node ? FANOUT_PASS1 : (args->my_nid + 1) * slice;
+
+        //for (size_t i = start; i < end; i++) {
+        //    size_t r_count = 0;
+        //    size_t s_count = 0;
+
+        //    for (size_t j = 0; j < args->n_nodes; j++) {
+        //        uint64_t *offset;
+        //        offset = &args->offset_r[j * args->offset_stride];
+        //        r_count += offset[i + 1] - offset[i] - PADDING_TUPLES;
+        //        offset = &args->offset_s[j * args->offset_stride];
+        //        s_count += offset[i + 1] - offset[i] - PADDING_TUPLES;
+        //    }
+
+
+        //    if (r_count == 0 || s_count == 0) {
+        //        continue;
+        //    }
+
+        //    task_t *task = task_queue_get_slot(part_queue);
+        //    //BUG_ON(!task);
+
+        //    for (size_t j = 0; j < args->n_nodes; j++) {
+        //        slice_t *slice;
+        //        uint64_t *offset;
+        //        tuple_t *tmp;
+
+        //        slice = slice_alloc();
+        //        //BUG_ON(!slice);
+        //        offset = &args->offset_r[j * args->offset_stride];
+        //        tmp = &args->tmp_r[j * args->tmp_stride];
+        //        slice->tuples = &tmp[offset[i]];
+        //        slice->n_tuples = offset[i + 1] - offset[i] - PADDING_TUPLES;
+        //        slice_list_add(&task->slices_r, slice);
+
+        //        slice = slice_alloc();
+        //        //BUG_ON(!slice);
+        //        offset = &args->offset_s[j * args->offset_stride];
+        //        tmp = &args->tmp_s[j * args->tmp_stride];
+        //        slice->tuples = &tmp[offset[i]];
+        //        slice->n_tuples = offset[i + 1] - offset[i] - PADDING_TUPLES;
+        //        slice_list_add(&task->slices_s, slice);
+        //    }
+
+        //    task->r_total_tuples = r_count;
+        //    task->s_total_tuples = s_count;
+        //    task_queue_add(part_queue, task);
+        //}
     }
 
     local_barrier(args->barrier);
@@ -385,6 +471,8 @@ void *drj_thread(void *arg) {
 
     uint64_t matches = 0;
     task_t *join_task;
+    void *prealloc = mem_for(args->my_tid, 10 * L1_CACHE_SIZE);
+    (void)prealloc;
     while ((join_task = task_queue_get_atomic(join_queue))) {
         matches += bucket_chaining_join(join_task, args->my_tid);
     }
@@ -403,10 +491,11 @@ void *drj_thread(void *arg) {
 
 void parallel_radix_partition(part_t * const part) {
     tuple_t const * restrict rel = part->rel.tuples;
-    uint64_t      * thist        = part->thist;
-    uint64_t      * restrict nhist = part->nhist;
-    uint64_t      * restrict ghist = part->ghist;
-    tuple_t       * restrict tmp = part->tmp;
+    uint64_t * thread_hist = part->thread_hist;
+    //uint64_t      * node_hist = part->node_hist;
+    //uint64_t      * restrict global_hist = part->global_hist;
+    tuple_t * local_tmp = part->local_tmp;
+    tuple_t * remote_tmp = part->remote_tmp;
 
     size_t const n_tuples      = part->rel.n_tuples;
     size_t const total_tuples  = part->total_tuples;
@@ -418,7 +507,7 @@ void parallel_radix_partition(part_t * const part) {
     size_t const tmp_stride    = part->tmp_stride;
 
     bool const is_coordinator_thread = (my_tid == COORDINATION_THREAD);
-    bool const is_coordinator_node   = (my_tid == COORDINATION_NODE);
+    //bool const is_coordinator_node   = (my_tid == COORDINATION_NODE);
 
     uint64_t const ignore_bits = 0;
     uint64_t const radix_bits  = N_RADIX_BITS_PASS1;
@@ -427,28 +516,79 @@ void parallel_radix_partition(part_t * const part) {
 
     /* offset: cluster i starts at offset[i] and ends at offset[i+1]-1 */
     /* dst: current write-out position within cluster i stored in dst[i] */
-    uint64_t * restrict offset = part->offset;
-    uint64_t * restrict dst = mem_for(my_tid, fanout * sizeof(uint64_t));
+    /* local stays on this node, remote goes to CXL memory */
+    uint64_t * local_offs = part->local_offs;
+    uint64_t * remote_offs = part->remote_offs;
+    //uint64_t * remote_offs = part->remote_offs;
+    //uint64_t * local_dst = mem_for(my_tid, fanout * sizeof(uint64_t));
+    //uint64_t * remote_dst = mem_for(my_tid, fanout * sizeof(uint64_t));
 
     /* Compute thread histogram */
     size_t stride = round_up(fanout, CACHELINE_SIZE / sizeof(uint64_t));
-    uint64_t *my_thist = &thist[my_tid * stride];
-    for (size_t i = 0; i < n_tuples; i++) {
-        size_t idx = hash(rel[i].key, mask, ignore_bits);
-        my_thist[idx]++;
+    uint64_t *my_thread_hist = &thread_hist[my_tid * stride];
+    for (size_t t = 0; t < n_tuples; t++) {
+        size_t p = hash(rel[t].key, mask, ignore_bits);
+        my_thread_hist[p]++;
     }
 
-    //local_barrier(part->barrier);
+    local_barrier(part->barrier);
 
-    ///* Compute node historgram */
-    //// TODO: optimize with vector instr?
     //if (is_coordinator_thread) {
-    //    for (size_t i = 0; i < n_threads; i++) {
-    //        for (size_t j = 0; j < fanout; j++) {
-    //            nhist[(my_nid * stride) + j] += thist[(i * stride) + j];
+    //    for (size_t t = 0; t < n_threads; t++) {
+    //        uint64_t *t_hist = &thread_hist[t * stride];
+    //        uint64_t *my_node_hist = &node_hist[my_nid * stride];
+    //        for (size_t p = 0; p < fanout; p++) {
+    //            my_node_hist[p] += t_hist[p];
+    //        }
+    //    }
+
+    //    uint64_t local_sum;
+    //    uint64_t remote_sum;
+    //    size_t local_idx;
+    //    size_t remote_idx;
+    //    for (size_t p = 0; p < fanout; p++) {
+    //        if (node_part_assign[p] == my_nid) {
+    //            dst[p] = 
     //        }
     //    }
     //}
+
+    /* Compute node historgram */
+    // TODO: optimize with vector instr?
+    uint64_t *node_hist = mem_for(my_tid, fanout * sizeof(uint64_t));
+    for (size_t t = 0; t < n_threads; t++) {
+        uint64_t *hist = &thread_hist[t * stride];
+        for (size_t p = 0; p < fanout; p++) {
+            node_hist[p] += hist[p];
+        }
+    }
+
+    // TODO: node part assignment must happen here!
+
+    uint64_t *dst = mem_for(my_tid, fanout * sizeof(uint64_t));
+    uint64_t local_sum = 0;
+    uint64_t remote_sum = 0;
+    size_t local_idx = 0;
+    size_t remote_idx = 0;
+    for (size_t p = 0; p < fanout; p++) {
+        if (node_part_assign(p) == my_nid) {
+            dst[p] = local_sum + (local_idx * PADDING_TUPLES);
+            local_sum += node_hist[p];
+            local_idx++;
+        }
+        else {
+            dst[p] = remote_sum + (remote_idx * PADDING_TUPLES);
+            remote_sum += node_hist[p];
+            remote_idx++;
+        }
+    }
+
+    for (size_t t = 0; t < my_tid; t++) {
+        uint64_t *hist = &thread_hist[t * stride];
+        for (size_t p = 0; p < fanout; p++) {
+            dst[p] += hist[p];
+        }
+    }
 
     //global_barrier(my_tid, part->barrier);
 
@@ -457,47 +597,65 @@ void parallel_radix_partition(part_t * const part) {
     //if (is_coordinator_node && is_coordinator_thread) {
     //    for (size_t i = 0; i < n_nodes; i++) {
     //        for (size_t j = 0; j < fanout; j++) {
-    //            ghist[j] += nhist[(i * stride) + j];
+    //            global_hist[j] += node_hist[(i * stride) + j];
     //        }
     //    }
     //}
 
     //global_barrier(my_tid, part->barrier);
 
-    /* Compute local prefix sum on hist */
-    size_t sum = 0;
-    for (size_t i = 0; i < fanout; i++) {
-        sum += my_thist[i];
-        my_thist[i] = sum;
-    }
+    ///* Compute local prefix sum on thread hist */
+    //size_t sum = 0;
+    //for (size_t i = 0; i < fanout; i++) {
+    //    sum += my_thread_hist[i];
+    //    my_thread_hist[i] = sum;
+    //}
 
-    /* Wait until other parallel threads compute histogram + prefix sum */
-    local_barrier(part->barrier);
+    ///* Wait until other parallel threads compute thread hist + prefix sum */
+    //local_barrier(part->barrier);
 
-    /* Determine the start and end of each cluster */
-    for (size_t i = 0; i < my_tid; i++) {
-        for (size_t j = 0; j < fanout; j++) {
-            dst[j] += thist[(i * stride) + j];
-        }
-    }
-    for (size_t i = my_tid; i < n_threads; i++) {
-        for (size_t j = 1; j < fanout; j++) {
-            dst[j] += thist[(i * stride) + (j - 1)];
-        }
-    }
-    for (size_t i = 0; i < fanout; i++) {
-        dst[i] += i * PADDING_TUPLES;
-    }
+    ///* Determine the start and end of each cluster */
+    //for (size_t t = 0; t < my_tid; t++) {
+    //    for (size_t p = 0; p < fanout; p++) {
+    //        //bool my_p = (node_part_assign(p) == my_nid); 
+    //        //uint64_t *dst = my_p ? local_dst : remote_dst;
+    //        dst[p] += thread_hist[(t * stride) + p];
+    //    }
+    //}
 
+    //for (size_t i = my_tid; i < n_threads; i++) {
+    //    for (size_t j = 1; j < fanout; j++) {
+    //        dst[j] += thread_hist[(i * stride) + (j - 1)];
+    //    }
+    //}
+
+    //for (size_t i = 0; i < fanout; i++) {
+    //    dst[i] += i * PADDING_TUPLES;
+    //}
+
+    // TODO: use non-temporal stores here?
     if (is_coordinator_thread) {
         /* Copy to global hist */
-        uint64_t *my_offset = &offset[my_nid * offset_stride];
-        memcpy(my_offset, dst, fanout * sizeof(dst[0]));
-        my_offset[fanout] = total_tuples + fanout * PADDING_TUPLES;
+        uint64_t *my_remote_offs = &remote_offs[my_nid * offset_stride];
+        size_t local_idx = 0;
+        size_t remote_idx = 0;
+        for (size_t p = 0; p < fanout; p++) {
+            if (node_part_assign(p) == my_nid) {
+                local_offs[local_idx] = dst[p];
+                local_idx++;
+            }
+            else {
+                my_remote_offs[remote_idx] = dst[p];
+                remote_idx++;
+            }
+        }
+        //memcpy(my_offs, dst, fanout * sizeof(dst[0]));
+        local_offs[local_idx] = local_sum + local_idx * PADDING_TUPLES;
+        my_remote_offs[remote_idx] = remote_sum + remote_idx * PADDING_TUPLES;
 
         /* Flush */
-        uintptr_t ptr = (uintptr_t) my_offset;
-        size_t size = offset_stride * sizeof(uint64_t);
+        uintptr_t ptr = (uintptr_t) my_remote_offs;
+        size_t size = round_up(offset_stride * sizeof(uint64_t), CACHELINE_SIZE);
         for (uintptr_t p = ptr; p < ptr + size; p += CACHELINE_SIZE) {
             _mm_clwb((void *)p);
         }
@@ -505,19 +663,18 @@ void parallel_radix_partition(part_t * const part) {
 
     }
 
-    // TODO: partition assignment to machines must happen here
-    //       so that we can know below which tuples to write to CXL mem and
-    //       which to write to local mem
-    // TODO: assignment is static for now; make skew-aware!
-
-    /* Copy tuples to their corresponding clusters */
-    // TODO: we have the segment approach
-    //       therefore, tuples for my machine do not need to be written to CXL memory
-    tuple_t *my_tmp = &tmp[my_nid * tmp_stride];
+    // TODO: use non-temporal stores here?
+    // TODO: how to do correct bandwidth combining here? probably need to find correct local/remote tuple ratio for writeout!
+    /* Write out tuples */
+    tuple_t *my_remote_tmp = &remote_tmp[my_nid * tmp_stride];
     for(size_t i = 0; i < n_tuples; i++) {
-        size_t idx = hash(rel[i].key, mask, ignore_bits);
-        my_tmp[dst[idx]] = rel[i];
-        dst[idx]++;
+        size_t p = hash(rel[i].key, mask, ignore_bits);
+        if (node_part_assign(p) == my_nid) {
+            local_tmp[dst[p]] = rel[i];
+        } else {
+            my_remote_tmp[dst[p]] = rel[i];
+        }
+        dst[p]++;
     }
 
     local_barrier(part->barrier);
@@ -526,8 +683,9 @@ void parallel_radix_partition(part_t * const part) {
     // TODO: clwb can be parallelized
     //       each thread writes back it's slice of this node's tmp buffer
     //       (via n_tuples/total_tuples and offset into my_tmp)
+    // TODO: do we need to flush entire buffer?
     if (is_coordinator_thread) {
-        uintptr_t ptr = (uintptr_t) my_tmp;
+        uintptr_t ptr = (uintptr_t) my_remote_tmp;
         size_t size = tmp_stride * sizeof(tuple_t);
         for (uintptr_t p = ptr; p < ptr + size; p += CACHELINE_SIZE) {
             _mm_clwb((void *)p);
@@ -547,8 +705,12 @@ serial_radix_partition(task_t * const task,
     size_t offset_s = 0;
     size_t const fanout = 1 << radix_bits;
 
+    //printf("serial_radix: tuple\n");
+    //printf("total_tuples: %ld, fanout: %ld, pad: %ld\n", task->r_total_tuples, FANOUT_PASS2, P_BYTES);
     tuple_t *tmp_r = mem_for(tid, task->r_total_tuples * sizeof(tuple_t) + (FANOUT_PASS2 + 1) * P_BYTES);
+    //printf("total_tuples: %ld, fanout: %ld, pad: %ld\n", task->s_total_tuples, FANOUT_PASS2, P_BYTES);
     tuple_t *tmp_s = mem_for(tid, task->s_total_tuples * sizeof(tuple_t) + (FANOUT_PASS2 + 1) * P_BYTES);
+    //printf("serial_radix: hist\n");
     uint64_t *hist_r = mem_for(tid, (fanout + 1) * sizeof(uint64_t));
     uint64_t *hist_s = mem_for(tid, (fanout + 1) * sizeof(uint64_t));
 
@@ -613,6 +775,7 @@ radix_partition(slice_list_t * restrict in,
     size_t offset = 0;
     uint64_t const padding_tuples = P_TUPLES;
 
+    //printf("radix: dst\n");
     uint64_t *dst = mem_for(tid, fanout * sizeof(uint64_t));
 
     /* Count tuples per partition */
@@ -652,9 +815,22 @@ bucket_chaining_join(task_t *task, size_t tid)
     uint64_t n_buckets = next_pow2(n_tuples);
     uint64_t const mask = (n_buckets - 1) << (N_RADIX_BITS);
 
-    uint64_t *key = mem_for(tid, n_tuples * sizeof(uint64_t));
-    uint64_t *next = mem_for(tid, n_tuples * sizeof(uint64_t));
-    uint64_t *bucket = mem_for(tid, n_buckets * sizeof(uint64_t));
+    //uint64_t *key = mem_for(tid, n_tuples * sizeof(uint64_t));
+    //uint64_t *next = mem_for(tid, n_tuples * sizeof(uint64_t));
+    //uint64_t *bucket = mem_for(tid, n_buckets * sizeof(uint64_t));
+
+    size_t key_size = round_up(n_tuples * sizeof(uint64_t), CACHELINE_SIZE);
+    size_t next_size = round_up(n_tuples * sizeof(uint64_t), CACHELINE_SIZE);
+    size_t bucket_size = round_up(n_buckets * sizeof(uint64_t), CACHELINE_SIZE);
+
+    //printf("memory needed: %ld\n", key_size + next_size + bucket_size);
+
+    uintptr_t base = (uintptr_t)mem_reuse_for(tid, key_size + next_size + bucket_size);
+    memset((void *)(base + key_size + next_size), 0, bucket_size);
+
+    uint64_t *key = (uint64_t *)(base);
+    uint64_t *next = (uint64_t *)(base + key_size);
+    uint64_t *bucket = (uint64_t *)(base + key_size + next_size);
 
     /* Build loop */
     slice_t *slice = task->slices_r.head;
