@@ -49,9 +49,14 @@ void *cxl_map(size_t size1, size_t size2, size_t offset) {
 
     /*
      * daberg301:
-     * - size1:
-     * - size2:
-     * - offset:
+     * - size1: 260650827776
+     * - size2: 289104986112
+     * - offset: 0
+     *
+     * daberg302:
+     * - size1: 260650827776
+     * - size2: 289104986112
+     * - offset: 0
      *
      * daberg303:
      * - size1: 242.75 GiB == 260650827776ul
