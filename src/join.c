@@ -116,12 +116,6 @@ static inline size_t node_part_assign(size_t p) {
 
 /* Impl */
 uint64_t join_relations(relation_t *r, relation_t *s, param_t *params) {
-    uint64_t result;
-    result = distributed(r, s, params);
-    return result;
-}
-
-uint64_t distributed(relation_t *r, relation_t *s, param_t *params) {
 #if DEBUG
     printf("Distributed mode\n");
 #endif
@@ -636,6 +630,8 @@ void parallel_radix_partition(part_t * const part) {
     // TODO: use non-temporal stores here?
     if (is_coordinator_thread) {
         /* Copy to global hist */
+
+        // 64 bit version:
         uint64_t *my_remote_offs = &remote_offs[my_nid * offset_stride];
         size_t local_idx = 0;
         size_t remote_idx = 0;
@@ -649,6 +645,82 @@ void parallel_radix_partition(part_t * const part) {
                 remote_idx++;
             }
         }
+
+        // 128 bit version:
+        //uint64_t *my_remote_offs = &remote_offs[my_nid * offset_stride];
+        //size_t local_idx = 0;
+        //size_t remote_idx = 0;
+        //bool have_pending = false;
+        //size_t pending_val = 0;
+        //for (size_t p = 0; p < fanout; p++) {
+        //    size_t o = dst[p];
+        //    if (node_part_assign(p) == my_nid) {
+        //        //local_offs[local_idx] = dst[p];
+        //        //local_idx++;
+        //        local_offs[local_idx++] = o;
+        //    }
+        //    else {
+        //        //my_remote_offs[remote_idx] = dst[p];
+        //        //remote_idx++;
+        //        if (!have_pending) {
+        //            pending_val = o;
+        //            have_pending = true;
+        //        }
+        //        else {
+        //            __m128i vec = _mm_set_epi64x((long long)o, (long long)pending_val);
+        //            _mm_stream_si128((__m128i*)&my_remote_offs[remote_idx], vec);
+        //            remote_idx += 2;
+        //            have_pending = false;
+        //        }
+        //    }
+        //}
+
+        //if (have_pending) {
+        //    _mm_stream_si64((long long*)&my_remote_offs[remote_idx], (long long)pending_val);
+        //    remote_idx++;
+        //}
+
+        // 512 bit version:
+        //uint64_t *my_remote_offs = &remote_offs[my_nid * offset_stride];
+        //size_t local_idx = 0;
+        //size_t remote_idx = 0;
+        //int32_t pending = 0;
+        //uint64_t buf512[8];
+        //for (size_t p = 0; p < fanout; p++) {
+        //    size_t o = dst[p];
+        //    if (node_part_assign(p) == my_nid) {
+        //        //local_offs[local_idx] = dst[p];
+        //        //local_idx++;
+        //        local_offs[local_idx++] = o;
+        //    }
+        //    else {
+        //        buf512[pending++] = o;
+        //        if (pending == 8) {
+        //            __m512i vec = _mm512_loadu_si512((const void*)buf512);
+        //            _mm512_stream_si512((__m512i*)&my_remote_offs[remote_idx], vec);
+        //            remote_idx += 8;
+        //            pending = 0;
+        //        }
+        //    }
+        //}
+
+        //int rem = pending;
+        //int off = 0;
+        //while (rem >= 2) {
+        //    __m128i v128 = _mm_set_epi64x((long long)buf512[off + 1],
+        //                                  (long long)buf512[off + 0]);
+        //    _mm_stream_si128((__m128i*)&my_remote_offs[remote_idx], v128);
+        //    remote_idx += 2;
+        //    off += 2;
+        //    rem -= 2;
+        //}
+        //if (rem == 1) {
+        //    _mm_stream_si64((long long*)&my_remote_offs[remote_idx], (long long)buf512[off]);
+        //    remote_idx++;
+        //}
+
+        //=====
+
         //memcpy(my_offs, dst, fanout * sizeof(dst[0]));
         local_offs[local_idx] = local_sum + local_idx * PADDING_TUPLES;
         my_remote_offs[remote_idx] = remote_sum + remote_idx * PADDING_TUPLES;
@@ -668,13 +740,28 @@ void parallel_radix_partition(part_t * const part) {
     /* Write out tuples */
     tuple_t *my_remote_tmp = &remote_tmp[my_nid * tmp_stride];
     for(size_t i = 0; i < n_tuples; i++) {
+        //size_t p = hash(rel[i].key, mask, ignore_bits);
+        //if (node_part_assign(p) == my_nid) {
+        //    local_tmp[dst[p]] = rel[i];
+        //} else {
+        //    my_remote_tmp[dst[p]] = rel[i];
+        //}
+        //dst[p]++;
+
         size_t p = hash(rel[i].key, mask, ignore_bits);
+        size_t idx = dst[p]++;
+
+        // load 16 bytes from rel[i]
+        __m128i t = _mm_loadu_si128((const __m128i*)&rel[i]);
+
         if (node_part_assign(p) == my_nid) {
-            local_tmp[dst[p]] = rel[i];
+            // local write: normal store
+            _mm_storeu_si128((__m128i*)&local_tmp[idx], t);
         } else {
-            my_remote_tmp[dst[p]] = rel[i];
+            // remote write: non-temporal store
+            _mm_stream_si128((__m128i*)&my_remote_tmp[idx], t);
+            //_mm_storeu_si128((__m128i*)&my_remote_tmp[idx], t);
         }
-        dst[p]++;
     }
 
     local_barrier(part->barrier);
