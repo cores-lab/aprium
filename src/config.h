@@ -4,7 +4,7 @@
 
 /* Program */
 #define VERSION "0.1.1"
-#define DEBUG 1
+#define DEBUG 0
 #define PERF 1
 
 /* Hardware */
@@ -35,13 +35,14 @@ static_assert(sizeof(CPU_MAPPING) == sizeof(CPU_MAPPING[0]) * N_CPUS);
 #define COORDINATION_THREAD 0
 
 /* Join */
-#define N_RADIX_BITS 16
+#define N_RADIX_BITS 18
 #define N_PASSES 2
 static_assert(N_PASSES <= 2);
 #define N_RADIX_BITS_PASS1 (N_RADIX_BITS / N_PASSES)
 #define N_RADIX_BITS_PASS2 (N_RADIX_BITS - N_RADIX_BITS_PASS1)
 #define FANOUT_PASS1 (1 << N_RADIX_BITS_PASS1)
-static_assert(N_RADIX_BITS_PASS1 == 8);
+static_assert(N_RADIX_BITS_PASS1 >= 8);
+static_assert(N_RADIX_BITS_PASS1 < 16);
 #define COMPRESSED_TUPLE_SIZE 15
 #define FANOUT_PASS2 (1 << N_RADIX_BITS_PASS2)
 /* Padding mem layout:

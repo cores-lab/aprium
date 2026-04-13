@@ -1,3 +1,4 @@
+#include <immintrin.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -43,6 +44,18 @@ static void *fill_worker(void *p) {
         a->tuples[i].key = (a->a * i + a->b) % a->n;
         a->tuples[i].rid = 0;
     }
+
+    uintptr_t start = (uintptr_t)&a->tuples[a->lo];
+    uintptr_t end   = (uintptr_t)&a->tuples[a->hi - 1] + sizeof(a->tuples[0]);
+
+    start &= ~(uintptr_t)(CACHELINE_SIZE - 1);
+    end    = (end + CACHELINE_SIZE - 1) & ~(uintptr_t)(CACHELINE_SIZE - 1);
+
+    for (uintptr_t p = start; p < end; p += CACHELINE_SIZE) {
+        _mm_clwb((void *)p);
+    }
+    _mm_sfence();
+
     return NULL;
 }
 

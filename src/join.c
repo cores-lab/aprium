@@ -1001,7 +1001,7 @@ radix_partition(slice_list_t * restrict in,
     slice_t *local_slice = in->head->next;
 
     // Extract pass-1 radix bits from the first tuple of the local slice
-    uint64_t p1_radix = local_slice->tuples[0].key & ((1ULL << shift_bits) - 1);
+    uint8_t p1_radix_byte = local_slice->tuples[0].key & 0xFF;
 
     /* Count tuples per partition */
     // 1. Local slice (uncompressed)
@@ -1013,11 +1013,13 @@ radix_partition(slice_list_t * restrict in,
     // 2. Remote slice (compressed, 15 bytes)
     // The bits we need were shifted down to the very bottom during compression!
     uint8_t *remote_bytes = (uint8_t *)remote_slice->tuples;
-    uint32_t pass2_mask = fanout - 1;
+    uint64_t compressed_shift = shift_bits - 8;
+    uint64_t compressed_mask = (fanout - 1) << compressed_shift;
     for (size_t i = 0; i < remote_slice->n_tuples; i++) {
         uint8_t *src = remote_bytes + (i * COMPRESSED_TUPLE_SIZE);
-        // Ultra-fast histogram: load lowest bytes directly and mask. Zero bit-shifts.
-        size_t idx = (*(uint32_t*)src) & pass2_mask;
+        // Since we only removed 8 bits, there are (shift_bits - 8) bits of Pass 1 remaining
+        // at the bottom of the compressed key. We pass the adjusted mask and shift!
+        size_t idx = hash(*(uint32_t*)src, compressed_mask, compressed_shift);
         hist[idx]++;
     }
 
@@ -1037,13 +1039,13 @@ radix_partition(slice_list_t * restrict in,
 
     // 2. Remote slice (compressed, 15 bytes)
     // Pre-create a 128-bit vector holding just the p1_radix in the lowest byte
-    __m128i radix_vec = _mm_set_epi64x(0, p1_radix);
+    __m128i radix_vec = _mm_set_epi64x(0, p1_radix_byte);
 
     for(size_t i = 0; i < remote_slice->n_tuples; i++) {
         uint8_t *src = remote_bytes + (i * COMPRESSED_TUPLE_SIZE);
 
-        // Ultra-fast index calculation (same as histogram loop)
-        size_t idx = (*(uint32_t*)src) & pass2_mask;
+        // Calculate index same as the histogram loop using the hash() function
+        size_t idx = hash(*(uint32_t*)src, compressed_mask, compressed_shift);
 
         // 1. Load 16 bytes (15 bytes of tuple + 1 garbage byte from next tuple)
         __m128i t = _mm_loadu_si128((const __m128i*)src);

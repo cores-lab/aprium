@@ -29,8 +29,10 @@ static void print_timing(size_t n_tuples, timing_t *timing)
     uint64_t build_probe = timing->build_probe - timing->part_local;
     double per_tuple = total / n_tuples;
 
+#if DEBUG
     printf("n_tuples,total,part_distr,part_assign,part_local,build_probe,"
            "per_tuple\n");
+#endif
     printf("%lu,%lu,%lu,%lu,%lu,%lu,%.4lf\n", n_tuples, total, part_distr,
             part_assign, part_local, build_probe, per_tuple);
 }

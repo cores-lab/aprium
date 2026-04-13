@@ -129,7 +129,7 @@ void cxl_alloc(size_t size1, size_t size2, size_t offset, size_t my_nid,
     bytes += tmp_s;
 
     BUG_ON(bytes % CACHELINE_SIZE);
-    BUG_ON(bytes > 127ULL * 1024 * 1024 * 1024); /* >127 GiB? */
+    BUG_ON(bytes > 512ULL * 1024 * 1024 * 1024); /* >512 GiB? */
 
 #if DEBUG
     printf("Initializing CXL memory (size = %.3lf MiB, addr = %p): ",
