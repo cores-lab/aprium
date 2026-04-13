@@ -142,7 +142,7 @@ void cxl_alloc(size_t size1, size_t size2, size_t offset, size_t my_nid,
         memset(base, 0, bytes);
     }
     else {
-        sleep(2);
+        sleep(5);
     }
 
     uintptr_t ptr = (uintptr_t)base;
