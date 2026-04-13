@@ -68,6 +68,15 @@ struct part {
 };
 typedef struct part part_t;
 
+/* Software write-combining buffer per partition (L1 cache optimized) */
+struct wc_buffer {
+    uint8_t buf[128];        // Safely fits up to 78 bytes + 16-byte SIMD shift margin
+    size_t bytes_used;
+    size_t cxl_byte_offset;  // Absolute byte offset in the CXL remote memory
+};
+
+typedef struct wc_buffer wc_buffer_t;
+
 /* Join */
 uint64_t distributed(relation_t *r, relation_t *s, param_t *params);
 void *drj_thread(void *args);
@@ -307,12 +316,12 @@ void *drj_thread(void *arg) {
 
             size_t r_local, r_remote, s_local, s_remote;
 
-            //size_t r_count = 0;
             r_local = local_offset_r[idx + 1] - local_offset_r[idx] - PADDING_TUPLES;
-            r_remote = remote_offset_r[idx + 1] - remote_offset_r[idx] - PADDING_TUPLES;
-            //size_t s_count = 0;
             s_local = local_offset_s[idx + 1] - local_offset_s[idx] - PADDING_TUPLES;
-            s_remote = remote_offset_s[idx + 1] - remote_offset_s[idx] - PADDING_TUPLES;
+
+            // Remote partitions: Offsets are tightly packed BYTES, no padding!
+            r_remote = (remote_offset_r[idx + 1] - remote_offset_r[idx]) / COMPRESSED_TUPLE_SIZE;
+            s_remote = (remote_offset_s[idx + 1] - remote_offset_s[idx]) / COMPRESSED_TUPLE_SIZE;
 
             size_t r_count = r_local + r_remote;
             size_t s_count = s_local + s_remote;
@@ -320,6 +329,7 @@ void *drj_thread(void *arg) {
             //printf("p-%03ld: r = %03ld + %03ld,\ts = %03ld + %03ld\n", p, r_local, r_remote, s_local, s_remote);
 
             if (r_count == 0 || s_count == 0) {
+                idx++;
                 continue;
             }
 
@@ -329,7 +339,10 @@ void *drj_thread(void *arg) {
             slice_t *slice;
             uint64_t *offset;
             tuple_t *tmp;
+            uint8_t *remote_bytes;
 
+            // TODO: if one of the slices is empty we still add it anyway.
+            //       this can be improved
             slice = slice_alloc();
             BUG_ON(!slice);
             offset = local_offset_r;
@@ -350,16 +363,21 @@ void *drj_thread(void *arg) {
             BUG_ON(!slice);
             offset = remote_offset_r;
             tmp = &cxl_p1_remote_tmp_r()[((args->my_nid + 1) % 2) * args->tmp_stride];
-            slice->tuples = &tmp[offset[idx]];
-            slice->n_tuples = offset[idx + 1] - offset[idx] - PADDING_TUPLES;
+            // We MUST cast the base pointer to uint8_t* before applying the offset!
+            // Otherwise C scales it by 16 bytes per index.
+            remote_bytes = (uint8_t *)tmp;
+            // Cast it back to tuple_t* so it fits in the struct (it will be decompressed later)
+            slice->tuples = (tuple_t *)&remote_bytes[offset[idx]];
+            slice->n_tuples = r_remote;
             slice_list_add(&task->slices_r, slice);
 
             slice = slice_alloc();
             BUG_ON(!slice);
             offset = remote_offset_s;
             tmp = &cxl_p1_remote_tmp_s()[((args->my_nid + 1) % 2) * args->tmp_stride];
-            slice->tuples = &tmp[offset[idx]];
-            slice->n_tuples = offset[idx + 1] - offset[idx] - PADDING_TUPLES;
+            remote_bytes = (uint8_t *)tmp;
+            slice->tuples = (tuple_t *)&remote_bytes[offset[idx]];
+            slice->n_tuples = s_remote;
             slice_list_add(&task->slices_s, slice);
 
             task->r_total_tuples = r_count;
@@ -492,11 +510,11 @@ void parallel_radix_partition(part_t * const part) {
     tuple_t * remote_tmp = part->remote_tmp;
 
     size_t const n_tuples      = part->rel.n_tuples;
-    size_t const total_tuples  = part->total_tuples;
+    //size_t const total_tuples  = part->total_tuples;
     size_t const my_tid        = part->my_tid;
     size_t const n_threads     = part->n_threads;
     size_t const my_nid        = part->my_nid;
-    size_t const n_nodes       = part->n_nodes;
+    //size_t const n_nodes       = part->n_nodes;
     size_t const offset_stride = part->offset_stride;
     size_t const tmp_stride    = part->tmp_stride;
 
@@ -542,7 +560,7 @@ void parallel_radix_partition(part_t * const part) {
     //    size_t remote_idx;
     //    for (size_t p = 0; p < fanout; p++) {
     //        if (node_part_assign[p] == my_nid) {
-    //            dst[p] = 
+    //            dst[p] =
     //        }
     //    }
     //}
@@ -561,9 +579,8 @@ void parallel_radix_partition(part_t * const part) {
 
     uint64_t *dst = mem_for(my_tid, fanout * sizeof(uint64_t));
     uint64_t local_sum = 0;
-    uint64_t remote_sum = 0;
+    uint64_t remote_sum_bytes = 0; // Track remote in bytes!
     size_t local_idx = 0;
-    size_t remote_idx = 0;
     for (size_t p = 0; p < fanout; p++) {
         if (node_part_assign(p) == my_nid) {
             dst[p] = local_sum + (local_idx * PADDING_TUPLES);
@@ -571,16 +588,20 @@ void parallel_radix_partition(part_t * const part) {
             local_idx++;
         }
         else {
-            dst[p] = remote_sum + (remote_idx * PADDING_TUPLES);
-            remote_sum += node_hist[p];
-            remote_idx++;
+            // Remote partitions are tightly packed byte-arrays (No padding logic here!)
+            dst[p] = remote_sum_bytes;
+            remote_sum_bytes += node_hist[p] * COMPRESSED_TUPLE_SIZE;
         }
     }
 
     for (size_t t = 0; t < my_tid; t++) {
         uint64_t *hist = &thread_hist[t * stride];
         for (size_t p = 0; p < fanout; p++) {
-            dst[p] += hist[p];
+            if (node_part_assign(p) == my_nid) {
+                dst[p] += hist[p]; // Local increments by tuples
+            } else {
+                dst[p] += hist[p] * COMPRESSED_TUPLE_SIZE; // Remote increments by bytes
+            }
         }
     }
 
@@ -611,7 +632,7 @@ void parallel_radix_partition(part_t * const part) {
     ///* Determine the start and end of each cluster */
     //for (size_t t = 0; t < my_tid; t++) {
     //    for (size_t p = 0; p < fanout; p++) {
-    //        //bool my_p = (node_part_assign(p) == my_nid); 
+    //        //bool my_p = (node_part_assign(p) == my_nid);
     //        //uint64_t *dst = my_p ? local_dst : remote_dst;
     //        dst[p] += thread_hist[(t * stride) + p];
     //    }
@@ -723,7 +744,7 @@ void parallel_radix_partition(part_t * const part) {
 
         //memcpy(my_offs, dst, fanout * sizeof(dst[0]));
         local_offs[local_idx] = local_sum + local_idx * PADDING_TUPLES;
-        my_remote_offs[remote_idx] = remote_sum + remote_idx * PADDING_TUPLES;
+        my_remote_offs[remote_idx] = remote_sum_bytes;
 
         /* Flush */
         uintptr_t ptr = (uintptr_t) my_remote_offs;
@@ -735,10 +756,20 @@ void parallel_radix_partition(part_t * const part) {
 
     }
 
+    wc_buffer_t *wc_bufs = mem_for(my_tid, fanout * sizeof(wc_buffer_t));
+
+    // Note: dst[p] contains TUPLE indices for local partitions, but BYTE offsets for remote!
+    for (size_t p = 0; p < fanout; p++) {
+        if (node_part_assign(p) != my_nid) {
+            wc_bufs[p].cxl_byte_offset = dst[p];
+        }
+    }
+
     // TODO: use non-temporal stores here?
     // TODO: how to do correct bandwidth combining here? probably need to find correct local/remote tuple ratio for writeout!
     /* Write out tuples */
     tuple_t *my_remote_tmp = &remote_tmp[my_nid * tmp_stride];
+    uint8_t *my_remote_tmp_bytes = (uint8_t *)my_remote_tmp;
     for(size_t i = 0; i < n_tuples; i++) {
         //size_t p = hash(rel[i].key, mask, ignore_bits);
         //if (node_part_assign(p) == my_nid) {
@@ -749,18 +780,83 @@ void parallel_radix_partition(part_t * const part) {
         //dst[p]++;
 
         size_t p = hash(rel[i].key, mask, ignore_bits);
-        size_t idx = dst[p]++;
-
-        // load 16 bytes from rel[i]
-        __m128i t = _mm_loadu_si128((const __m128i*)&rel[i]);
 
         if (node_part_assign(p) == my_nid) {
-            // local write: normal store
+            size_t idx = dst[p]++;
+            __m128i t = _mm_loadu_si128((const __m128i*)&rel[i]);
+            // local write: store
             _mm_storeu_si128((__m128i*)&local_tmp[idx], t);
         } else {
-            // remote write: non-temporal store
-            _mm_stream_si128((__m128i*)&my_remote_tmp[idx], t);
-            //_mm_storeu_si128((__m128i*)&my_remote_tmp[idx], t);
+            // remote write: compression, write-combining, non-temp store
+            wc_buffer_t *wc = &wc_bufs[p];
+
+            uint64_t key = ((uint64_t*)&rel[i])[0];
+            uint64_t payload = ((uint64_t*)&rel[i])[1];
+
+            // Cut out the 8 radix bits
+            uint64_t lower_mask = (1ULL << ignore_bits) - 1;
+            uint64_t compressed_key = (key & lower_mask) | ((key >> (ignore_bits + 8)) << ignore_bits);
+
+            // SUPER FAST PACKING: Overlapping scalar stores (no memcpy, no complex SIMD)
+            // byte 0-7 gets key. Then byte 7-14 gets payload, perfectly overwriting the unused 8th key byte!
+            uint8_t *dest = wc->buf + wc->bytes_used;
+            *(uint64_t*)dest = compressed_key;
+            *(uint64_t*)(dest + 7) = payload;
+
+            wc->bytes_used += COMPRESSED_TUPLE_SIZE;
+
+            // If we've crossed the 64-byte threshold, flush exactly one cache line
+            if (wc->bytes_used >= 64) {
+                uint8_t *cxl_dest = my_remote_tmp_bytes + wc->cxl_byte_offset;
+
+                // Stream exactly 64 bytes using a single AVX-512 instruction
+                // cxl_dest is perfectly aligned by our initialization logic.
+#if defined(__AVX512F__)
+                __m512i vec = _mm512_loadu_si512((const __m512i *)&wc->buf[0]);
+                _mm512_storeu_si512((__m512i *)&cxl_dest[0], vec);
+#elif defined(__AVX2__)
+                __m256i v0 = _mm256_loadu_si256((const __m256i *)&wc->buf[0]);
+                __m256i v1 = _mm256_loadu_si256((const __m256i *)&wc->buf[32]);
+                _mm256_storeu_si256((__m256i *)&cxl_dest[0], v0);
+                _mm256_storeu_si256((__m256i *)&cxl_dest[32], v1);
+#else
+                __m128i v0 = _mm_loadu_si128((const __m128i *)&wc->buf[0]);
+                __m128i v1 = _mm_loadu_si128((const __m128i *)&wc->buf[16]);
+                __m128i v2 = _mm_loadu_si128((const __m128i *)&wc->buf[32]);
+                __m128i v3 = _mm_loadu_si128((const __m128i *)&wc->buf[48]);
+                _mm_storeu_si128((__m128i *)&cxl_dest[0], v0);
+                _mm_storeu_si128((__m128i *)&cxl_dest[16], v1);
+                _mm_storeu_si128((__m128i *)&cxl_dest[32], v2);
+                _mm_storeu_si128((__m128i *)&cxl_dest[48], v3);
+#endif
+
+                // TODO: check if write-back helps here
+                //// Force the unaligned write out to CXL memory.
+                //// Since it's unaligned, it may cross two cache lines.
+                //_mm_clwb(&cxl_dest[0]);
+                //_mm_clwb(&cxl_dest[63]);
+
+                wc->cxl_byte_offset += 64;
+                wc->bytes_used -= 64;
+
+                // Shift the remainder (max 14 bytes) to the front of the buffer
+                // A single 16-byte SIMD read/write safely covers the remaining bytes
+                _mm_storeu_si128((__m128i*)&wc->buf[0], _mm_loadu_si128((__m128i*)&wc->buf[64]));
+            }
+        }
+    }
+
+    for (size_t p = 0; p < fanout; p++) {
+        if (node_part_assign(p) != my_nid && wc_bufs[p].bytes_used > 0) {
+            uint8_t *cxl_dest = my_remote_tmp_bytes + wc_bufs[p].cxl_byte_offset;
+            size_t bytes_to_write = wc_bufs[p].bytes_used;
+
+            // Write the unaligned remainder safely
+            memcpy(cxl_dest, wc_bufs[p].buf, bytes_to_write);
+
+            // TODO: check if write-back helps here
+            //_mm_clwb(cxl_dest);
+            //_mm_clwb(cxl_dest + 63);
         }
     }
 
@@ -775,6 +871,7 @@ void parallel_radix_partition(part_t * const part) {
         uintptr_t ptr = (uintptr_t) my_remote_tmp;
         size_t size = tmp_stride * sizeof(tuple_t);
         for (uintptr_t p = ptr; p < ptr + size; p += CACHELINE_SIZE) {
+            // TODO: use flush or wb here?
             _mm_clwb((void *)p);
         }
         _mm_sfence();
@@ -857,6 +954,40 @@ radix_partition(slice_list_t * restrict in,
                 uint64_t const radix_bits,
                 size_t tid)
 {
+    //size_t const fanout = 1 << radix_bits;
+    //uint64_t const mask = (fanout - 1) << shift_bits;
+    //size_t offset = 0;
+    //uint64_t const padding_tuples = P_TUPLES;
+
+    ////printf("radix: dst\n");
+    //uint64_t *dst = mem_for(tid, fanout * sizeof(uint64_t));
+
+    ///* Count tuples per partition */
+    //slice_t *slice = in->head;
+    //while (slice) {
+    //    for (size_t i = 0; i < slice->n_tuples; i++) {
+    //        size_t idx = hash(slice->tuples[i].key, mask, shift_bits);
+    //        hist[idx]++;
+    //    }
+    //    slice = slice->next;
+    //}
+    ///* Determine the start and end of each partition depending on the counts */
+    //for (size_t i = 0; i < fanout; i++) {
+    //    dst[i] = offset + i * padding_tuples;
+    //    offset += hist[i];
+    //}
+
+    ///* Copy tuples to their corresponding partitions at appropriate offsets */
+    //slice = in->head;
+    //while (slice) {
+    //    for(size_t i = 0; i < slice->n_tuples; i++) {
+    //        size_t idx = hash(slice->tuples[i].key, mask, shift_bits);
+    //        out[ dst[idx] ] = slice->tuples[i];
+    //        ++dst[idx];
+    //    }
+    //    slice = slice->next;
+    //}
+
     size_t const fanout = 1 << radix_bits;
     uint64_t const mask = (fanout - 1) << shift_bits;
     size_t offset = 0;
@@ -865,15 +996,31 @@ radix_partition(slice_list_t * restrict in,
     //printf("radix: dst\n");
     uint64_t *dst = mem_for(tid, fanout * sizeof(uint64_t));
 
+    // The list has exactly two slices: local (uncompressed) and remote (compressed)
+    slice_t *remote_slice = in->head;
+    slice_t *local_slice = in->head->next;
+
+    // Extract pass-1 radix bits from the first tuple of the local slice
+    uint64_t p1_radix = local_slice->tuples[0].key & ((1ULL << shift_bits) - 1);
+
     /* Count tuples per partition */
-    slice_t *slice = in->head;
-    while (slice) {
-        for (size_t i = 0; i < slice->n_tuples; i++) {
-            size_t idx = hash(slice->tuples[i].key, mask, shift_bits);
-            hist[idx]++;
-        }
-        slice = slice->next;
+    // 1. Local slice (uncompressed)
+    for (size_t i = 0; i < local_slice->n_tuples; i++) {
+        size_t idx = hash(local_slice->tuples[i].key, mask, shift_bits);
+        hist[idx]++;
     }
+
+    // 2. Remote slice (compressed, 15 bytes)
+    // The bits we need were shifted down to the very bottom during compression!
+    uint8_t *remote_bytes = (uint8_t *)remote_slice->tuples;
+    uint32_t pass2_mask = fanout - 1;
+    for (size_t i = 0; i < remote_slice->n_tuples; i++) {
+        uint8_t *src = remote_bytes + (i * COMPRESSED_TUPLE_SIZE);
+        // Ultra-fast histogram: load lowest bytes directly and mask. Zero bit-shifts.
+        size_t idx = (*(uint32_t*)src) & pass2_mask;
+        hist[idx]++;
+    }
+
     /* Determine the start and end of each partition depending on the counts */
     for (size_t i = 0; i < fanout; i++) {
         dst[i] = offset + i * padding_tuples;
@@ -881,70 +1028,85 @@ radix_partition(slice_list_t * restrict in,
     }
 
     /* Copy tuples to their corresponding partitions at appropriate offsets */
-    slice = in->head;
-    while (slice) {
-        for(size_t i = 0; i < slice->n_tuples; i++) {
-            size_t idx = hash(slice->tuples[i].key, mask, shift_bits);
-            out[ dst[idx] ] = slice->tuples[i];
-            ++dst[idx];
-        }
-        slice = slice->next;
+    // 1. Local slice (uncompressed)
+    for(size_t i = 0; i < local_slice->n_tuples; i++) {
+        size_t idx = hash(local_slice->tuples[i].key, mask, shift_bits);
+        out[ dst[idx] ] = local_slice->tuples[i];
+        ++dst[idx];
+    }
+
+    // 2. Remote slice (compressed, 15 bytes)
+    // Pre-create a 128-bit vector holding just the p1_radix in the lowest byte
+    __m128i radix_vec = _mm_set_epi64x(0, p1_radix);
+
+    for(size_t i = 0; i < remote_slice->n_tuples; i++) {
+        uint8_t *src = remote_bytes + (i * COMPRESSED_TUPLE_SIZE);
+
+        // Ultra-fast index calculation (same as histogram loop)
+        size_t idx = (*(uint32_t*)src) & pass2_mask;
+
+        // 1. Load 16 bytes (15 bytes of tuple + 1 garbage byte from next tuple)
+        __m128i t = _mm_loadu_si128((const __m128i*)src);
+
+        // 2. Shift entire 128-bit vector LEFT by 1 byte (8 bits)
+        // This drops the garbage byte off the end, aligns the 15-byte tuple
+        // to the top 15 bytes, and sets byte 0 to 0x00!
+        t = _mm_slli_si128(t, 1);
+
+        // 3. Drop the p1_radix into the 0x00 hole at byte 0
+        t = _mm_or_si128(t, radix_vec);
+
+        // 4. Store the perfectly reconstructed 16-byte tuple
+        _mm_storeu_si128((__m128i*)&out[dst[idx]], t);
+        ++dst[idx];
     }
 }
 
 uint64_t
 bucket_chaining_join(task_t *task, size_t tid)
 {
-    // TODO: we can optimize here if slice list only has one slice!
     uint64_t matches = 0;
 
     size_t n_tuples = task->r_total_tuples;
+    if (n_tuples == 0) return 0;
+
     uint64_t n_buckets = next_pow2(n_tuples);
     uint64_t const mask = (n_buckets - 1) << (N_RADIX_BITS);
 
-    //uint64_t *key = mem_for(tid, n_tuples * sizeof(uint64_t));
-    //uint64_t *next = mem_for(tid, n_tuples * sizeof(uint64_t));
-    //uint64_t *bucket = mem_for(tid, n_buckets * sizeof(uint64_t));
+    size_t next_size = round_up(n_tuples * sizeof(uint32_t), CACHELINE_SIZE);
+    size_t bucket_size = round_up(n_buckets * sizeof(uint32_t), CACHELINE_SIZE);
 
-    size_t key_size = round_up(n_tuples * sizeof(uint64_t), CACHELINE_SIZE);
-    size_t next_size = round_up(n_tuples * sizeof(uint64_t), CACHELINE_SIZE);
-    size_t bucket_size = round_up(n_buckets * sizeof(uint64_t), CACHELINE_SIZE);
+    uintptr_t base = (uintptr_t)mem_reuse_for(tid, next_size + bucket_size);
+    memset((void *)(base + next_size), 0, bucket_size);
 
-    //printf("memory needed: %ld\n", key_size + next_size + bucket_size);
+    uint32_t *next = (uint32_t *)(base);
+    uint32_t *bucket = (uint32_t *)(base + next_size);
 
-    uintptr_t base = (uintptr_t)mem_reuse_for(tid, key_size + next_size + bucket_size);
-    memset((void *)(base + key_size + next_size), 0, bucket_size);
-
-    uint64_t *key = (uint64_t *)(base);
-    uint64_t *next = (uint64_t *)(base + key_size);
-    uint64_t *bucket = (uint64_t *)(base + key_size + next_size);
+    // We assume exactly one slice per relation in this phase
+    slice_t *slice_r = task->slices_r.head;
+    tuple_t *build_tuples = slice_r->tuples;
 
     /* Build loop */
-    slice_t *slice = task->slices_r.head;
-    size_t eidx = 0;
-    while (slice) {
-        for (size_t i = 0; i < slice->n_tuples; i++) {
-            size_t idx = hash(slice->tuples[i].key, mask, N_RADIX_BITS);
-            key[eidx] = slice->tuples[i].key;
-            next[eidx] = bucket[idx];
-            /* Start positions from 1, 0 marks empty bucket */
-            bucket[idx] = ++eidx;
-        }
-        slice = slice->next;
+    for (size_t i = 0; i < slice_r->n_tuples; i++) {
+        size_t idx = hash(build_tuples[i].key, mask, N_RADIX_BITS);
+        next[i] = bucket[idx];
+        /* Start positions from 1, 0 marks empty bucket */
+        bucket[idx] = i + 1;
     }
 
     /* Probe loop */
-    slice = task->slices_s.head;
-    while (slice) {
-        for (size_t i = 0; i < slice->n_tuples; i++) {
-            size_t idx = hash(slice->tuples[i].key, mask, N_RADIX_BITS);
-            for (int hit = bucket[idx]; hit > 0; hit = next[hit - 1]) {
-                if (slice->tuples[i].key == key[hit - 1]) {
+    slice_t *slice_s = task->slices_s.head;
+    if (slice_s && slice_s->n_tuples > 0) {
+        tuple_t *probe_tuples = slice_s->tuples;
+        for (size_t i = 0; i < slice_s->n_tuples; i++) {
+            size_t idx = hash(probe_tuples[i].key, mask, N_RADIX_BITS);
+            for (uint32_t hit = bucket[idx]; hit > 0; hit = next[hit - 1]) {
+                // Fetch the key directly from the build tuples slice
+                if (probe_tuples[i].key == build_tuples[hit - 1].key) {
                     matches++;
                 }
             }
         }
-        slice = slice->next;
     }
 
     return matches;

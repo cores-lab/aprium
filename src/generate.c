@@ -8,47 +8,47 @@
 #include "config.h"
 #include "cxl.h"
 
-//void fill_relation(relation_t *rel) {
-//    for (size_t i = 0; i < rel->n_tuples; i++) {
-//        rel->tuples[i].key = i;
-//    }
-//
-//    for (size_t i = rel->n_tuples - 1; i > 0; i--) {
-//        size_t j = ((double) rand() / ((double) RAND_MAX + 1)) * i;
-//        uint64_t tmp = rel->tuples[i].key;
-//        rel->tuples[i].key = rel->tuples[j].key;
-//        rel->tuples[j].key = tmp;
-//    }
-//
-//    for (size_t i = 0; i < rel->n_tuples; i++) {
-//        rel->tuples[i].rid = i;
-//    }
-//}
-
-void fill_relation(relation_t *rel, char const *filename) {
-    FILE *fp = fopen(filename, "rb");
-    BUG_ON(!fp);
-
-    if (fseeko(fp, 0, SEEK_END) != 0) {
-        fclose(fp);
-        BUG_ON(1);
+void fill_relation(relation_t *rel) {
+    for (size_t i = 0; i < rel->n_tuples; i++) {
+        rel->tuples[i].key = i;
     }
 
-    off_t file_size = ftello(fp);
-    BUG_ON(file_size < 0);
-
-    BUG_ON((size_t)file_size < rel->n_tuples * sizeof(tuple_t));
-
-    if (fseeko(fp, 0, SEEK_SET) != 0) {
-        fclose(fp);
-        BUG_ON(1);
+    for (size_t i = rel->n_tuples - 1; i > 0; i--) {
+        size_t j = ((double) rand() / ((double) RAND_MAX + 1)) * i;
+        uint64_t tmp = rel->tuples[i].key;
+        rel->tuples[i].key = rel->tuples[j].key;
+        rel->tuples[j].key = tmp;
     }
 
-    size_t got = fread(rel->tuples, 1, rel->n_tuples * sizeof(tuple_t), fp);
-    fclose(fp);
-
-    BUG_ON(got != rel->n_tuples * sizeof(tuple_t));
+    for (size_t i = 0; i < rel->n_tuples; i++) {
+        rel->tuples[i].rid = i;
+    }
 }
+
+//void fill_relation(relation_t *rel, char const *filename) {
+//    FILE *fp = fopen(filename, "rb");
+//    BUG_ON(!fp);
+//
+//    if (fseeko(fp, 0, SEEK_END) != 0) {
+//        fclose(fp);
+//        BUG_ON(1);
+//    }
+//
+//    off_t file_size = ftello(fp);
+//    BUG_ON(file_size < 0);
+//
+//    BUG_ON((size_t)file_size < rel->n_tuples * sizeof(tuple_t));
+//
+//    if (fseeko(fp, 0, SEEK_SET) != 0) {
+//        fclose(fp);
+//        BUG_ON(1);
+//    }
+//
+//    size_t got = fread(rel->tuples, 1, rel->n_tuples * sizeof(tuple_t), fp);
+//    fclose(fp);
+//
+//    BUG_ON(got != rel->n_tuples * sizeof(tuple_t));
+//}
 
 
 void get_slices(relation_t *slice_r, relation_t *slice_s, param_t *params) {
@@ -70,7 +70,8 @@ void get_slices(relation_t *slice_r, relation_t *slice_s, param_t *params) {
         fflush(stdout);
 #endif
 
-        fill_relation(&r, "/mnt/nvme5/moritz/r-64GiB.bin");
+        fill_relation(&r);
+        //fill_relation(&r, "/mnt/nvme5/moritz/r-64GiB.bin");
 
 #if DEBUG
         printf("OK\n");
@@ -83,7 +84,8 @@ void get_slices(relation_t *slice_r, relation_t *slice_s, param_t *params) {
         fflush(stdout);
 #endif
 
-        fill_relation(&s, "/mnt/nvme5/moritz/s-64GiB.bin");
+        fill_relation(&s);
+        //fill_relation(&s, "/mnt/nvme5/moritz/s-64GiB.bin");
 
 #if DEBUG
         printf("OK\n");

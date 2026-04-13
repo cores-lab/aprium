@@ -47,32 +47,6 @@ void *cxl_map(size_t size1, size_t size2, size_t offset) {
     char const *dev1 = "/dev/dax0.0";
     char const *dev2 = "/dev/dax1.0";
 
-    /*
-     * daberg301:
-     * - size1: 260650827776
-     * - size2: 289104986112
-     * - offset: 0
-     *
-     * daberg302:
-     * - size1: 260650827776
-     * - size2: 289104986112
-     * - offset: 0
-     *
-     * daberg303:
-     * - size1: 242.75 GiB == 260650827776ul
-     * - size2: 141.25 GiB == 151666032640ul
-     * - offset: 0 GiB == 0ul
-     *           -OR-
-     *           256 GiB == 256ul << 30
-     *
-     * daberg304:
-     * - size1: 242.75 GiB == 260650827776ul
-     * - size2: 77.25 GiB == 82934620160ul & ~(align - 1) == 82933972992ul
-     * - offset: 0 GiB == 0ul
-     *           -OR-
-     *           192 GiB == 192ul << 30
-     */
-
     uint64_t total = size1 + size2;
     uint64_t align = 2ULL * 1024 * 1024; /* 2 MiB */
 
@@ -123,6 +97,7 @@ void *cxl_map(size_t size1, size_t size2, size_t offset) {
 }
 
 static size_t tmp_size(size_t n_tuples, size_t n_nodes) {
+    // TODO: here we assume uniform relations
     size_t tmp = rcl((n_tuples / n_nodes) * sizeof(tuple_t) + RELATION_PADDING);
     return tmp * n_nodes;
 }

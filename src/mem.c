@@ -53,7 +53,7 @@ void mem_alloc(size_t r_tuples, size_t s_tuples, size_t n_threads) {
     // TODO: here we assume uniform relations
     // TODO: here we assume R and S are same size
     // TODO: here we assume cacheline alignment
-    size_t per_thread = 8ULL * r_tuples * sizeof(tuple_t) / 2ULL;
+    size_t per_thread = 1ULL * r_tuples * sizeof(tuple_t) / 2ULL;
     /* allocator metadata */
     size_t meta = round_up(n_threads * sizeof(allocator_t), CACHELINE_SIZE);
 
