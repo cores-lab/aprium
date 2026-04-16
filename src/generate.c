@@ -5,10 +5,35 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>
 
 #include "generate.h"
 #include "config.h"
 #include "cxl.h"
+
+/* PRNG SplitMix64 */
+
+#define PRNG_WEYL_CONST 0x9e3779b97f4a7c15ULL // Golden ratio fractional part
+#define PRNG_MIX1       0xbf58476d1ce4e5b9ULL // Avalanche multiplier 1
+#define PRNG_MIX2       0x94d049bb133111ebULL // Avalanche multiplier 2
+
+static uint64_t mix64(uint64_t x) {
+    x = (x ^ (x >> 30)) * PRNG_MIX1;
+    x = (x ^ (x >> 27)) * PRNG_MIX2;
+    return x ^ (x >> 31);
+}
+
+static uint64_t next_u64(uint64_t *state) {
+    *state += PRNG_WEYL_CONST;
+    return mix64(*state);
+}
+
+static double u64_to_unit(uint64_t x) {
+    // Keep 53 bits for standard IEEE 754 double precision mantissa
+    return (x >> 11) * (1.0 / (double)(1ULL << 53));
+}
+
+/* Uniform distribution */
 
 typedef struct {
     tuple_t *tuples;
@@ -17,7 +42,7 @@ typedef struct {
     uint64_t n;
     uint64_t a;
     uint64_t b;
-} fill_arg_t;
+} fill_uniform_arg_t;
 
 static uint64_t gcd64(uint64_t x, uint64_t y) {
     while (y != 0) {
@@ -28,17 +53,8 @@ static uint64_t gcd64(uint64_t x, uint64_t y) {
     return x;
 }
 
-static uint64_t mix64(uint64_t x) {
-    x ^= x >> 33;
-    x *= 0xff51afd7ed558ccdULL;
-    x ^= x >> 33;
-    x *= 0xc4ceb9fe1a85ec53ULL;
-    x ^= x >> 33;
-    return x;
-}
-
-static void *fill_worker(void *p) {
-    fill_arg_t *a = (fill_arg_t *)p;
+static void *fill_worker_uniform(void *p) {
+    fill_uniform_arg_t *a = (fill_uniform_arg_t *)p;
 
     for (size_t i = a->lo; i < a->hi; ++i) {
         a->tuples[i].key = (a->a * i + a->b) % a->n;
@@ -46,8 +62,7 @@ static void *fill_worker(void *p) {
     }
 
     uintptr_t start = (uintptr_t)&a->tuples[a->lo];
-    uintptr_t end   = (uintptr_t)&a->tuples[a->hi - 1] + sizeof(a->tuples[0]);
-
+    uintptr_t end   = (uintptr_t)&a->tuples[a->hi];
     start &= ~(uintptr_t)(CACHELINE_SIZE - 1);
     end    = (end + CACHELINE_SIZE - 1) & ~(uintptr_t)(CACHELINE_SIZE - 1);
 
@@ -59,12 +74,14 @@ static void *fill_worker(void *p) {
     return NULL;
 }
 
-void fill_relation(relation_t *rel, size_t n_threads) {
+void fill_relation_uniform(relation_t *rel, size_t n_threads) {
+    if (n_threads == 0) return;
     if (n_threads > rel->n_tuples) n_threads = rel->n_tuples;
 
     uint64_t n = rel->n_tuples;
     uint64_t seed = (uint64_t)time(NULL) ^ (uint64_t)(uintptr_t)rel;
 
+    // Calculate a and b for the LCG bijection to ensure unique key permutations
     uint64_t a = mix64(seed) | 1ULL;
     while (gcd64(a, n) != 1) {
         a += 2;
@@ -72,10 +89,10 @@ void fill_relation(relation_t *rel, size_t n_threads) {
     uint64_t b = mix64(seed + 1) % n;
 
     pthread_t tids[n_threads];
-    fill_arg_t args[n_threads];
+    fill_uniform_arg_t args[n_threads];
 
-    size_t base = rel->n_tuples / n_threads;
-    size_t rem  = rel->n_tuples % n_threads;
+    size_t base = n / n_threads;
+    size_t rem  = n % n_threads;
     size_t pos  = 0;
 
     for (size_t t = 0; t < n_threads; ++t) {
@@ -88,7 +105,7 @@ void fill_relation(relation_t *rel, size_t n_threads) {
         args[t].a = a;
         args[t].b = b;
 
-        pthread_create(&tids[t], NULL, fill_worker, &args[t]);
+        pthread_create(&tids[t], NULL, fill_worker_uniform, &args[t]);
         pos += len;
     }
 
@@ -97,53 +114,145 @@ void fill_relation(relation_t *rel, size_t n_threads) {
     }
 }
 
-//void fill_relation(relation_t *rel) {
-//    for (size_t i = 0; i < rel->n_tuples; i++) {
-//        rel->tuples[i].key = i;
-//    }
-//
-//    for (size_t i = rel->n_tuples - 1; i > 0; i--) {
-//        size_t j = ((double) rand() / ((double) RAND_MAX + 1)) * i;
-//        uint64_t tmp = rel->tuples[i].key;
-//        rel->tuples[i].key = rel->tuples[j].key;
-//        rel->tuples[j].key = tmp;
-//    }
-//
-//    for (size_t i = 0; i < rel->n_tuples; i++) {
-//        rel->tuples[i].rid = i;
-//    }
-//}
+/* Zipfian distribution */
 
-//void fill_relation(relation_t *rel, char const *filename) {
-//    FILE *fp = fopen(filename, "rb");
-//    BUG_ON(!fp);
-//
-//    if (fseeko(fp, 0, SEEK_END) != 0) {
-//        fclose(fp);
-//        BUG_ON(1);
-//    }
-//
-//    off_t file_size = ftello(fp);
-//    BUG_ON(file_size < 0);
-//
-//    BUG_ON((size_t)file_size < rel->n_tuples * sizeof(tuple_t));
-//
-//    if (fseeko(fp, 0, SEEK_SET) != 0) {
-//        fclose(fp);
-//        BUG_ON(1);
-//    }
-//
-//    size_t got = fread(rel->tuples, 1, rel->n_tuples * sizeof(tuple_t), fp);
-//    fclose(fp);
-//
-//    BUG_ON(got != rel->n_tuples * sizeof(tuple_t));
-//}
+typedef struct {
+    tuple_t *tuples;
+    size_t lo, hi;
+    const uint64_t *keys; // random permutation of 0..n-1
+    const double *cdf;    // Zipf CDF over ranks 1..n
+    size_t n;
+    uint64_t rng;
+} fill_zipf_arg_t;
 
+static double *make_zipf_cdf(size_t n, double tau) {
+    double *cdf = malloc(n * sizeof(*cdf));
+    BUG_ON(!cdf);
+
+    double sum = 0.0;
+    for (size_t k = 1; k <= n; ++k) {
+        sum += 1.0 / pow((double)k, tau);
+    }
+
+    double acc = 0.0;
+    for (size_t k = 1; k <= n; ++k) {
+        acc += (1.0 / pow((double)k, tau)) / sum;
+        cdf[k - 1] = acc;
+    }
+    cdf[n - 1] = 1.0;
+    return cdf;
+}
+
+static uint64_t *make_keys(size_t n, uint64_t *seed) {
+    uint64_t *keys = malloc(n * sizeof(*keys));
+    BUG_ON(!keys);
+
+    for (size_t i = 0; i < n; ++i) {
+        keys[i] = i;
+    }
+
+    for (size_t i = n - 1; i > 0; --i) {
+        size_t j = (size_t)(next_u64(seed) % (i + 1));
+        uint64_t tmp = keys[i];
+        keys[i] = keys[j];
+        keys[j] = tmp;
+    }
+    return keys;
+}
+
+static uint64_t sample_zipf(const uint64_t *keys, const double *cdf, size_t n,
+                            uint64_t *rng) {
+    double r = u64_to_unit(next_u64(rng));
+    size_t low = 0, high = n - 1;
+
+    while (low < high) {
+        size_t mid = low + (high - low) / 2;
+        if (r > cdf[mid]) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    return keys[low];
+}
+
+static void *fill_worker_zipf(void *p) {
+    fill_zipf_arg_t *a = (fill_zipf_arg_t *)p;
+
+    for (size_t i = a->lo; i < a->hi; ++i) {
+        a->tuples[i].key = sample_zipf(a->keys, a->cdf, a->n, &a->rng);
+        a->tuples[i].rid = 0;
+    }
+
+    uintptr_t start = (uintptr_t)&a->tuples[a->lo];
+    uintptr_t end   = (uintptr_t)&a->tuples[a->hi];
+    start &= ~(uintptr_t)(CACHELINE_SIZE - 1);
+    end    = (end + CACHELINE_SIZE - 1) & ~(uintptr_t)(CACHELINE_SIZE - 1);
+
+    for (uintptr_t p = start; p < end; p += CACHELINE_SIZE) {
+        _mm_clwb((void *)p);
+    }
+    _mm_sfence();
+
+    return NULL;
+}
+
+void fill_relation_zipf(relation_t *rel, size_t n_threads, double tau) {
+    size_t n = rel->n_tuples;
+    if (n_threads > n) n_threads = n;
+
+    uint64_t seed = (uint64_t)time(NULL) ^ (uint64_t)(uintptr_t)rel;
+
+    double *cdf = make_zipf_cdf(n, tau);
+    uint64_t *keys = make_keys(n, &seed);
+
+    pthread_t tids[n_threads];
+    fill_zipf_arg_t args[n_threads];
+
+    size_t base = n / n_threads, rem = n % n_threads, pos = 0;
+    for (size_t t = 0; t < n_threads; ++t) {
+        size_t len = base + (t < rem);
+
+        args[t].tuples = rel->tuples;
+        args[t].lo = pos;
+        args[t].hi = pos + len;
+        args[t].keys = keys;
+        args[t].cdf = cdf;
+        args[t].n = n;
+        args[t].rng = mix64(seed + t + 1);
+
+        pthread_create(&tids[t], NULL, fill_worker_zipf, &args[t]);
+        pos += len;
+    }
+
+    for (size_t t = 0; t < n_threads; ++t) {
+        pthread_join(tids[t], NULL);
+    }
+
+    free(keys);
+    free(cdf);
+}
+
+/* Loading from disk */
+
+void load_relation(relation_t *rel, char const *filename) {
+    FILE *fp = fopen(filename, "rb");
+    BUG_ON(!fp);
+
+    BUG_ON(fseeko(fp, 0, SEEK_END) != 0);
+    off_t file_size = ftello(fp);
+    BUG_ON(file_size < 0 || (size_t)file_size < rel->n_tuples * sizeof(tuple_t));
+
+    BUG_ON(fseeko(fp, 0, SEEK_SET) != 0);
+    size_t got = fread(rel->tuples, 1, rel->n_tuples * sizeof(tuple_t), fp);
+    fclose(fp);
+
+    BUG_ON(got != rel->n_tuples * sizeof(tuple_t));
+}
 
 void get_slices(relation_t *slice_r, relation_t *slice_s, param_t *params) {
-    relation_t r;
-    relation_t s;
-    bool const is_coordinator_node = (params->my_nid == COORDINATION_NODE);
+    relation_t r, s;
+    bool const is_coordinator = (params->my_nid == COORDINATION_NODE);
 
     /* Init relations R & S */
     r.tuples = cxl_gen_r();
@@ -151,32 +260,28 @@ void get_slices(relation_t *slice_r, relation_t *slice_s, param_t *params) {
     s.tuples = cxl_gen_s();
     s.n_tuples = params->s_size;
 
-    if (is_coordinator_node) {
+    if (is_coordinator) {
 #if DEBUG
         printf("Creating relation R (size = %.3lf MiB, #tuples = %lu) : ",
-                (double) sizeof(tuple_t) * params->r_size / 1024.0 / 1024.0,
+                (double)sizeof(tuple_t) * params->r_size / (1024.0 * 1024.0),
                 params->r_size);
         fflush(stdout);
 #endif
 
-        //fill_relation(&r);
-        fill_relation(&r, params->n_threads);
-        //fill_relation(&r, "/mnt/nvme5/moritz/r-64GiB.bin");
+        fill_relation_uniform(&r, params->n_threads);
+        //fill_relation_zipf(&r, params->n_threads, 1.0);
+        //load_relation(&r, "/mnt/nvme5/moritz/r-64GiB.bin");
 
 #if DEBUG
-        printf("OK\n");
-#endif
-
-#if DEBUG
-        printf("Creating relation S (size = %.3lf MiB, #tuples = %lu) : ",
-                (double) sizeof(tuple_t) * params->s_size / 1024.0 / 1024.0,
+        printf("OK\nCreating relation S (size = %.3lf MiB, #tuples = %lu) : ",
+                (double)sizeof(tuple_t) * params->s_size / (1024.0 * 1024.0),
                 params->s_size);
         fflush(stdout);
 #endif
 
-        //fill_relation(&s);
-        fill_relation(&s, params->n_threads);
-        //fill_relation(&s, "/mnt/nvme5/moritz/s-64GiB.bin");
+        fill_relation_uniform(&s, params->n_threads);
+        //fill_relation_zipf(&s, params->n_threads, 1.0);
+        //load_relation(&s, "/mnt/nvme5/moritz/s-64GiB.bin");
 
 #if DEBUG
         printf("OK\n");
@@ -188,49 +293,22 @@ void get_slices(relation_t *slice_r, relation_t *slice_s, param_t *params) {
     size_t r_slice = params->r_size / params->n_nodes;
     size_t s_slice = params->s_size / params->n_nodes;
 
-    size_t my_r_size;
-    size_t my_s_size;
     size_t r_offset = params->my_nid * r_slice;
-    size_t s_offset;
+    slice_r->tuples = r.tuples + r_offset;
+    slice_r->n_tuples = (params->my_nid == params->n_nodes - 1)
+        ? params->r_size - r_offset
+        : r_slice;
 
-    if (params->my_nid == params->n_nodes - 1) {
-        my_r_size = params->r_size - r_slice * (params->n_nodes - 1);
-    } else {
-        my_r_size = r_slice;
-    }
-
-    if (params->my_nid == 0) {
-        my_s_size = params->s_size - s_slice * (params->n_nodes - 1);
-        s_offset   = s_slice * (params->n_nodes - 1);
-    } else {
-        my_s_size = s_slice;
-        s_offset   = (params->my_nid - 1) * s_slice;
-    }
-
-    //tuple_t *my_r_tuples;
-    //my_r_tuples = aligned_alloc(CACHELINE_SIZE, my_r_size * sizeof(tuple_t));
-    //BUG_ON(!my_r_tuples);
-    //tuple_t *my_s_tuples;
-    //my_s_tuples = aligned_alloc(CACHELINE_SIZE, my_s_size * sizeof(tuple_t));
-    //BUG_ON(!my_s_tuples);
-
-    //memcpy(my_r_tuples, r.tuples + r_offset, my_r_size * sizeof(tuple_t));
-    //memcpy(my_s_tuples, s.tuples + s_offset, my_s_size * sizeof(tuple_t));
-
-    //slice_r->tuples   = my_r_tuples;
-    //slice_r->n_tuples = my_r_size;
-    //slice_s->tuples   = my_s_tuples;
-    //slice_s->n_tuples = my_s_size;
-
-    slice_r->tuples   = r.tuples + r_offset;
-    slice_r->n_tuples = my_r_size;
-    slice_s->tuples   = s.tuples + s_offset;
-    slice_s->n_tuples = my_s_size;
+    size_t s_offset = (params->my_nid == 0)
+        ? s_slice * (params->n_nodes - 1)
+        : (params->my_nid - 1) * s_slice;
+    slice_s->tuples = s.tuples + s_offset;
+    slice_s->n_tuples = (params->my_nid == 0)
+        ? params->s_size - s_offset
+        : s_slice;
 }
 
 void release_slices(relation_t *slice_r, relation_t *slice_s) {
     (void)slice_r;
     (void)slice_s;
-    //free(slice_r->tuples);
-    //free(slice_s->tuples);
 }
