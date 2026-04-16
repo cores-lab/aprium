@@ -4,7 +4,7 @@
 
 /* Program */
 #define VERSION "0.1.1"
-#define DEBUG 0
+#define DEBUG 1
 #define PERF 1
 
 /* Hardware */

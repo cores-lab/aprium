@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -std=gnu23 -Wall -Wextra -Werror -MMD -O3 -mclflushopt -mclwb -flto
+CFLAGS = -std=gnu23 -Wall -Wextra -MMD -O3 -mclflushopt -mclwb -mavx512f -flto -D_GNU_SOURCE
 LDFLAGS = -lm
 SRC_FILES = main.c cli.c generate.c join.c mem.c cxl.c
 SRC_DIR = src

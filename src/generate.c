@@ -1,5 +1,6 @@
 #include <immintrin.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -89,6 +90,9 @@ void fill_relation_uniform(relation_t *rel, size_t n_threads) {
     uint64_t b = mix64(seed + 1) % n;
 
     pthread_t tids[n_threads];
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    cpu_set_t set;
     fill_uniform_arg_t args[n_threads];
 
     size_t base = n / n_threads;
@@ -105,7 +109,12 @@ void fill_relation_uniform(relation_t *rel, size_t n_threads) {
         args[t].a = a;
         args[t].b = b;
 
-        pthread_create(&tids[t], NULL, fill_worker_uniform, &args[t]);
+        int cpu = CPU_MAPPING[t];
+        CPU_ZERO(&set);
+        CPU_SET(cpu, &set);
+        BUG_ON(pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &set));
+        BUG_ON(pthread_create(&tids[t], &attr, fill_worker_uniform, &args[t]));
+
         pos += len;
     }
 
@@ -207,6 +216,9 @@ void fill_relation_zipf(relation_t *rel, size_t n_threads, double tau) {
     uint64_t *keys = make_keys(n, &seed);
 
     pthread_t tids[n_threads];
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    cpu_set_t set;
     fill_zipf_arg_t args[n_threads];
 
     size_t base = n / n_threads, rem = n % n_threads, pos = 0;
@@ -221,7 +233,12 @@ void fill_relation_zipf(relation_t *rel, size_t n_threads, double tau) {
         args[t].n = n;
         args[t].rng = mix64(seed + t + 1);
 
-        pthread_create(&tids[t], NULL, fill_worker_zipf, &args[t]);
+        int cpu = CPU_MAPPING[t];
+        CPU_ZERO(&set);
+        CPU_SET(cpu, &set);
+        BUG_ON(pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &set));
+        BUG_ON(pthread_create(&tids[t], &attr, fill_worker_zipf, &args[t]));
+
         pos += len;
     }
 
@@ -268,8 +285,8 @@ void get_slices(relation_t *slice_r, relation_t *slice_s, param_t *params) {
         fflush(stdout);
 #endif
 
-        fill_relation_uniform(&r, params->n_threads);
-        //fill_relation_zipf(&r, params->n_threads, 1.0);
+        //fill_relation_uniform(&r, params->n_threads);
+        fill_relation_zipf(&r, params->n_threads, 0.0);
         //load_relation(&r, "/mnt/nvme5/moritz/r-64GiB.bin");
 
 #if DEBUG
@@ -279,8 +296,8 @@ void get_slices(relation_t *slice_r, relation_t *slice_s, param_t *params) {
         fflush(stdout);
 #endif
 
-        fill_relation_uniform(&s, params->n_threads);
-        //fill_relation_zipf(&s, params->n_threads, 1.0);
+        //fill_relation_uniform(&s, params->n_threads);
+        fill_relation_zipf(&s, params->n_threads, 0.0);
         //load_relation(&s, "/mnt/nvme5/moritz/s-64GiB.bin");
 
 #if DEBUG
