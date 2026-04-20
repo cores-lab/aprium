@@ -28,11 +28,8 @@ struct mem {
     barrier_t *barrier; /* one barrier per node */
     tuple_t *gen_r;
     tuple_t *gen_s;
-    //uint64_t *node_hist_r;
-    //uint64_t *node_hist_s;
-    //uint64_t *global_hist_r;
-    //uint64_t *global_hist_s;
-    // old
+    uint64_t *node_hist_r;
+    uint64_t *node_hist_s;
     uint64_t *offs_r;
     uint64_t *offs_s;
     tuple_t *remote_tmp_r;
@@ -98,7 +95,7 @@ void *cxl_map(size_t size1, size_t size2, size_t offset) {
 
 static size_t tmp_size(size_t n_tuples, size_t n_nodes) {
     // TODO: here we assume uniform relations
-    size_t tmp = rcl((n_tuples / n_nodes) * sizeof(tuple_t) + RELATION_PADDING);
+    size_t tmp = round_up((n_tuples / n_nodes) * sizeof(tuple_t) + RELATION_PADDING, CACHELINE_SIZE);
     return tmp * n_nodes;
 }
 
@@ -111,11 +108,11 @@ void cxl_alloc(size_t size1, size_t size2, size_t offset, size_t my_nid,
     size_t bytes = 0;
 
     size_t barrier = n_nodes * sizeof(barrier_t);
-    size_t r_size = rcl(r_tuples * sizeof(tuple_t));
-    size_t s_size = rcl(s_tuples * sizeof(tuple_t));
-    size_t global_hist = rcl(FANOUT_PASS1 * sizeof(uint64_t));
+    size_t r_size = round_up(r_tuples * sizeof(tuple_t), CACHELINE_SIZE);
+    size_t s_size = round_up(s_tuples * sizeof(tuple_t), CACHELINE_SIZE);
+    size_t global_hist = round_up(FANOUT_PASS1 * sizeof(uint64_t), CACHELINE_SIZE);
     size_t node_hist = global_hist * n_nodes;
-    size_t offs = rcl((FANOUT_PASS1 + 1) * sizeof(uint64_t)) * n_nodes;
+    size_t offs = round_up((FANOUT_PASS1 + 1) * sizeof(uint64_t), CACHELINE_SIZE) * n_nodes;
     size_t tmp_r = tmp_size(r_tuples, n_nodes);
     size_t tmp_s = tmp_size(s_tuples, n_nodes);
 
@@ -123,7 +120,6 @@ void cxl_alloc(size_t size1, size_t size2, size_t offset, size_t my_nid,
     bytes += r_size;
     bytes += s_size;
     bytes += 2ULL * node_hist;
-    bytes += 2ULL * global_hist;
     bytes += 2ULL * offs;
     bytes += tmp_r;
     bytes += tmp_s;
@@ -145,28 +141,19 @@ void cxl_alloc(size_t size1, size_t size2, size_t offset, size_t my_nid,
         sleep(5);
     }
 
-    uintptr_t ptr = (uintptr_t)base;
-    for (uintptr_t p = ptr; p < ptr + bytes; p += CACHELINE_SIZE) {
-        _mm_clflushopt((void *)p);
-    }
-    _mm_sfence();
-    //atomic_thread_fence(memory_order_seq_cst);
+    cache_wb(base, bytes, true);
 
+    uintptr_t ptr = (uintptr_t)base;
     mem.barrier = (barrier_t *)(ptr);
     ptr += barrier;
     mem.gen_r = (tuple_t *)ptr;
     ptr += r_size;
     mem.gen_s = (tuple_t *)ptr;
     ptr += s_size;
-    //mem.node_hist_r = (uint64_t *)ptr;
-    //ptr += node_hist;
-    //mem.node_hist_s = (uint64_t *)ptr;
-    //ptr += node_hist;
-    //mem.global_hist_r = (uint64_t *)ptr;
-    //ptr += global_hist;
-    //mem.global_hist_s = (uint64_t *)ptr;
-    //ptr += global_hist;
-    // TODO: offs should be global_offs, if needed at all?
+    mem.node_hist_r = (uint64_t *)ptr;
+    ptr += node_hist;
+    mem.node_hist_s = (uint64_t *)ptr;
+    ptr += node_hist;
     mem.offs_r = (uint64_t *)ptr;
     ptr += offs;
     mem.offs_s = (uint64_t *)ptr;
@@ -193,13 +180,11 @@ void cxl_free(void) {
 /* Barrier */
 static inline void store_flush(volatile uint64_t *p, uint64_t v) {
     *p = v;
-    _mm_clwb((void *)p);
-    _mm_sfence();
+    cache_wb((void *)p, sizeof(p), true);
 }
 
 static inline uint64_t load_inval(volatile uint64_t *p) {
-    _mm_clflushopt((void *)p);
-    _mm_lfence();
+    cache_inv((void *)p, sizeof(p), true);
     return *p;
 }
 
@@ -239,23 +224,14 @@ tuple_t *cxl_gen_s(void) {
     return mem.gen_s;
 }
 
-//uint64_t *cxl_p1_node_hist_r(void) {
-//    return mem.node_hist_r;
-//}
-//
-//uint64_t *cxl_p1_node_hist_s(void) {
-//    return mem.node_hist_s;
-//}
-//
-//uint64_t *cxl_p1_global_hist_r(void) {
-//    return mem.global_hist_r;
-//}
-//
-//uint64_t *cxl_p1_global_hist_s(void) {
-//    return mem.global_hist_s;
-//}
+uint64_t *cxl_p1_node_hist_r(void) {
+    return mem.node_hist_r;
+}
 
-//old
+uint64_t *cxl_p1_node_hist_s(void) {
+    return mem.node_hist_s;
+}
+
 uint64_t *cxl_p1_remote_offs_r(void) {
     return mem.offs_r;
 }

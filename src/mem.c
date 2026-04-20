@@ -20,13 +20,13 @@ struct mem {
     size_t n_threads;
     uint64_t *thread_hist_r;
     uint64_t *thread_hist_s;
+    uint8_t  *part_assign;
     uint64_t *local_offs_r;
     uint64_t *local_offs_s;
     tuple_t *local_tmp_r;
     tuple_t *local_tmp_s;
     //uint64_t *global_hist_r;
     //uint64_t *global_hist_s;
-    //uint8_t *node_part_assign;
     allocator_t *alloc; /* one allocator per thread */
 };
 typedef struct mem mem_t;
@@ -49,19 +49,18 @@ void mem_alloc(size_t r_tuples, size_t s_tuples, size_t n_threads) {
     size_t p1_local_tmp_r = tmp_size(r_tuples);
     size_t p1_local_tmp_s = tmp_size(s_tuples);
 
+    size_t p1_part_assign = round_up(FANOUT_PASS1 * sizeof(uint8_t), CACHELINE_SIZE);
+
     /* per thread */
     // TODO: here we assume uniform relations
     // TODO: here we assume R and S are same size
     // TODO: here we assume cacheline alignment
-    //size_t per_thread = 1ULL * r_tuples * sizeof(tuple_t) / 2ULL;
-    size_t per_thread = 3 * (rcl(2 * sizeof(uint64_t) * FANOUT_PASS1)
-        + rcl(1 * sizeof(uint64_t) * FANOUT_PASS2)
-        + rcl(2 * sizeof(uint64_t) * (FANOUT_PASS2+1))
-        + rcl(1 * 144 * FANOUT_PASS1)
-        //+ rcl(r_tuples / FANOUT_PASS1 * sizeof(tuple_t)
-        //+ (FANOUT_PASS2+1) * P_BYTES) * FANOUT_PASS1 / 2 / n_threads)
-        + rcl((r_tuples / n_threads) * sizeof(tuple_t)))
-        + rcl(10 * L1_CACHE_SIZE);
+    size_t per_thread = 4 * (round_up(2 * sizeof(uint64_t) * FANOUT_PASS1, CACHELINE_SIZE)
+        + round_up(1 * sizeof(uint64_t) * FANOUT_PASS2, CACHELINE_SIZE)
+        + round_up(2 * sizeof(uint64_t) * (FANOUT_PASS2+1), CACHELINE_SIZE)
+        + round_up(1 * 144 * FANOUT_PASS1, CACHELINE_SIZE)
+        + round_up((r_tuples / n_threads) * sizeof(tuple_t), CACHELINE_SIZE))
+        + round_up(10 * L1_CACHE_SIZE, CACHELINE_SIZE);
 
     /* allocator metadata */
     size_t meta = round_up(n_threads * sizeof(allocator_t), CACHELINE_SIZE);
@@ -70,6 +69,7 @@ void mem_alloc(size_t r_tuples, size_t s_tuples, size_t n_threads) {
     size_t bytes = 0;
     bytes += 2ULL * p1_thread_hist;
     bytes += 2ULL * p1_local_offs;
+    bytes += p1_part_assign;
     bytes += p1_local_tmp_r;
     bytes += p1_local_tmp_s;
     bytes += meta;
@@ -98,6 +98,8 @@ void mem_alloc(size_t r_tuples, size_t s_tuples, size_t n_threads) {
     ptr += p1_local_offs;
     mem.local_offs_s = (uint64_t *)ptr;
     ptr += p1_local_offs;
+    mem.part_assign = (uint8_t *)ptr;
+    ptr += p1_part_assign;
     mem.local_tmp_r = (tuple_t *)ptr;
     ptr += p1_local_tmp_r;
     mem.local_tmp_s = (tuple_t *)ptr;
@@ -128,6 +130,10 @@ uint64_t *mem_p1_thread_hist_r(void) {
 
 uint64_t *mem_p1_thread_hist_s(void) {
     return mem.thread_hist_s;
+}
+
+uint8_t *mem_p1_part_assign(void) {
+    return mem.part_assign;
 }
 
 uint64_t *mem_p1_local_offs_r(void) {

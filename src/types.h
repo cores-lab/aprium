@@ -3,18 +3,15 @@
 #include <stddef.h>
 #include <stdint.h>
 
-typedef struct tuple tuple_t;
-typedef struct relation relation_t;
-
-struct tuple {
+typedef struct {
     uint64_t key;
     uint64_t rid;
-};
+} tuple_t;
 
 // TODO: move slice definition here
 
-struct relation {
+typedef struct {
     tuple_t *tuples;
     size_t n_tuples;
-};
+} relation_t;
 

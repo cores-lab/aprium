@@ -1,5 +1,7 @@
 #pragma once
 
+#include <immintrin.h>
+
 #include "types.h"
 
 /* Program */
@@ -37,13 +39,13 @@ static_assert(sizeof(CPU_MAPPING) == sizeof(CPU_MAPPING[0]) * N_CPUS);
 /* Join */
 #define N_RADIX_BITS 18
 #define N_PASSES 2
-static_assert(N_PASSES <= 2);
+static_assert(N_PASSES == 2);
 #define N_RADIX_BITS_PASS1 (N_RADIX_BITS / N_PASSES)
 #define N_RADIX_BITS_PASS2 (N_RADIX_BITS - N_RADIX_BITS_PASS1)
-#define FANOUT_PASS1 (1 << N_RADIX_BITS_PASS1)
 static_assert(N_RADIX_BITS_PASS1 >= 8);
 static_assert(N_RADIX_BITS_PASS1 < 16);
 #define COMPRESSED_TUPLE_SIZE 15
+#define FANOUT_PASS1 (1 << N_RADIX_BITS_PASS1)
 #define FANOUT_PASS2 (1 << N_RADIX_BITS_PASS2)
 /* Padding mem layout:
  * | Pass1_part0                    | P | ... | Pass1_partN | P |
@@ -54,8 +56,9 @@ static_assert(N_RADIX_BITS_PASS1 < 16);
 #define P_TUPLES (P_BYTES / sizeof(tuple_t))
 #define PADDING_TUPLES (P_TUPLES * (FANOUT_PASS2 + 1))
 #define RELATION_PADDING (PADDING_TUPLES * FANOUT_PASS1 * sizeof(tuple_t))
-#define SKEW 0.0
-static_assert(SKEW >= 0 && SKEW <= 1);
+#define ZIPF 0.0
+static_assert(ZIPF >= 0 && ZIPF <= 1.5);
+#define OVERALLOC 2.0
 
 /* Helper */
 #define BUG_ON(cond)                                         \
@@ -71,6 +74,35 @@ static inline size_t round_up(size_t s, size_t a) {
     return (s + (a - 1)) & ~(a - 1);
 }
 
-static inline size_t rcl(size_t s) {
-    return round_up(s, CACHELINE_SIZE);
+static inline void cache_wb(void *addr, size_t len, bool fence) {
+    uintptr_t start = (uintptr_t)addr & ~(CACHELINE_SIZE - 1);
+    uintptr_t end = (uintptr_t)addr + len;
+    for (uintptr_t p = start; p < end; p += CACHELINE_SIZE) {
+        _mm_clwb((void *)p);
+    }
+    if (fence) {
+        _mm_sfence();
+    }
+}
+
+static inline void cache_flush(void *addr, size_t len, bool fence) {
+    uintptr_t start = (uintptr_t)addr & ~(CACHELINE_SIZE - 1);
+    uintptr_t end = (uintptr_t)addr + len;
+    for (uintptr_t p = start; p < end; p += CACHELINE_SIZE) {
+        _mm_clflushopt((void *)p);
+    }
+    if (fence) {
+        _mm_sfence();
+    }
+}
+
+static inline void cache_inv(void *addr, size_t len, bool fence) {
+    uintptr_t start = (uintptr_t)addr & ~(CACHELINE_SIZE - 1);
+    uintptr_t end = (uintptr_t)addr + len;
+    for (uintptr_t p = start; p < end; p += CACHELINE_SIZE) {
+        _mm_clflushopt((void *)p);
+    }
+    if (fence) {
+        _mm_mfence();
+    }
 }

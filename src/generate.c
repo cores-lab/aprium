@@ -62,15 +62,7 @@ static void *fill_worker_uniform(void *p) {
         a->tuples[i].rid = 0;
     }
 
-    uintptr_t start = (uintptr_t)&a->tuples[a->lo];
-    uintptr_t end   = (uintptr_t)&a->tuples[a->hi];
-    start &= ~(uintptr_t)(CACHELINE_SIZE - 1);
-    end    = (end + CACHELINE_SIZE - 1) & ~(uintptr_t)(CACHELINE_SIZE - 1);
-
-    for (uintptr_t p = start; p < end; p += CACHELINE_SIZE) {
-        _mm_clwb((void *)p);
-    }
-    _mm_sfence();
+    cache_wb(&a->tuples[a->lo], sizeof(a->tuples[0]) * (a->hi - a->lo), true);
 
     return NULL;
 }
@@ -193,15 +185,7 @@ static void *fill_worker_zipf(void *p) {
         a->tuples[i].rid = 0;
     }
 
-    uintptr_t start = (uintptr_t)&a->tuples[a->lo];
-    uintptr_t end   = (uintptr_t)&a->tuples[a->hi];
-    start &= ~(uintptr_t)(CACHELINE_SIZE - 1);
-    end    = (end + CACHELINE_SIZE - 1) & ~(uintptr_t)(CACHELINE_SIZE - 1);
-
-    for (uintptr_t p = start; p < end; p += CACHELINE_SIZE) {
-        _mm_clwb((void *)p);
-    }
-    _mm_sfence();
+    cache_wb(&a->tuples[a->lo], sizeof(a->tuples[0]) * (a->hi - a->lo), true);
 
     return NULL;
 }
@@ -285,8 +269,8 @@ void get_slices(relation_t *slice_r, relation_t *slice_s, param_t *params) {
         fflush(stdout);
 #endif
 
-        //fill_relation_uniform(&r, params->n_threads);
-        fill_relation_zipf(&r, params->n_threads, 0.0);
+        fill_relation_uniform(&r, params->n_threads);
+        //fill_relation_zipf(&r, params->n_threads, ZIPF);
         //load_relation(&r, "/mnt/nvme5/moritz/r-64GiB.bin");
 
 #if DEBUG
@@ -296,8 +280,8 @@ void get_slices(relation_t *slice_r, relation_t *slice_s, param_t *params) {
         fflush(stdout);
 #endif
 
-        //fill_relation_uniform(&s, params->n_threads);
-        fill_relation_zipf(&s, params->n_threads, 0.0);
+        fill_relation_uniform(&s, params->n_threads);
+        //fill_relation_zipf(&s, params->n_threads, ZIPF);
         //load_relation(&s, "/mnt/nvme5/moritz/s-64GiB.bin");
 
 #if DEBUG

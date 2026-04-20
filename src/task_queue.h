@@ -30,29 +30,16 @@ struct task_queue {
 #endif
 };
 
-static task_queue_t *task_queue_init(size_t max_size);
-static void task_queue_free(task_queue_t *queue);
-
-static inline task_t *task_queue_get_atomic(task_queue_t *queue);
-static inline void task_queue_add_atomic(task_queue_t *queue, task_t *task);
-static inline void task_queue_add(task_queue_t *queue, task_t *task);
-static inline task_t *task_queue_get_slot_atomic(task_queue_t * queue);
-static inline task_t *task_queue_get_slot(task_queue_t *queue);
-
-task_queue_t *task_queue_init(size_t max_size) {
+static task_queue_t *task_queue_init(size_t size) {
     task_queue_t *queue = malloc(sizeof(task_queue_t));
-    if (!queue) {
-        return NULL;
-    }
+    BUG_ON(!queue);
 
     pthread_mutex_init(&queue->lock, NULL);
     queue->head = NULL;
 
+    size_t max_size = (size_t)(size * OVERALLOC);
     queue->tasks = calloc(max_size, sizeof(task_t));
-    if (!queue->tasks) {
-        free(queue);
-        return NULL;
-    }
+    BUG_ON(!queue->tasks);
 
     queue->max_size = max_size;
     atomic_init(&queue->next_free, 0);
@@ -63,13 +50,13 @@ task_queue_t *task_queue_init(size_t max_size) {
     return queue;
 }
 
-void task_queue_free(task_queue_t *queue) {
+static void task_queue_free(task_queue_t *queue) {
     pthread_mutex_destroy(&queue->lock);
     free(queue->tasks);
     free(queue);
 }
 
-static inline task_t *task_queue_get_atomic(task_queue_t *queue) {
+static task_t *task_queue_get_atomic(task_queue_t *queue) {
     pthread_mutex_lock(&queue->lock);
     task_t *t = queue->head;
     if (t) {
@@ -82,13 +69,7 @@ static inline task_t *task_queue_get_atomic(task_queue_t *queue) {
     return t;
 }
 
-static inline void task_queue_add_atomic(task_queue_t *queue, task_t *task) {
-    pthread_mutex_lock(&queue->lock);
-    task_queue_add(queue, task);
-    pthread_mutex_unlock(&queue->lock);
-}
-
-static inline void task_queue_add(task_queue_t *queue, task_t *task) {
+static void task_queue_add(task_queue_t *queue, task_t *task) {
     task->next = queue->head;
     queue->head = task;
 #if DEBUG
@@ -96,20 +77,23 @@ static inline void task_queue_add(task_queue_t *queue, task_t *task) {
 #endif
 }
 
-static inline task_t *task_queue_get_slot(task_queue_t *queue) {
-    size_t idx = queue->next_free;
-    if (idx >= queue->max_size) {
-        return NULL;
-    }
-    queue->next_free = idx + 1;
-    return &queue->tasks[idx];
+static void task_queue_add_atomic(task_queue_t *queue, task_t *task) {
+    pthread_mutex_lock(&queue->lock);
+    task_queue_add(queue, task);
+    pthread_mutex_unlock(&queue->lock);
 }
 
-static inline task_t *task_queue_get_slot_atomic(task_queue_t *queue) {
+static task_t *task_queue_get_slot(task_queue_t *queue) {
+    if (queue->next_free >= queue->max_size) {
+        return NULL;
+    }
+    return &queue->tasks[queue->next_free++];
+}
+
+static task_t *task_queue_get_slot_atomic(task_queue_t *queue) {
     size_t idx = atomic_fetch_add(&queue->next_free, 1);
     if (idx >= queue->max_size) {
         return NULL;
     }
     return &queue->tasks[idx];
 }
-
