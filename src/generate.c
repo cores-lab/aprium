@@ -263,26 +263,40 @@ void get_slices(relation_t *slice_r, relation_t *slice_s, param_t *params) {
 
     if (is_coordinator) {
 #if DEBUG
-        printf("Creating relation R (size = %.3lf MiB, #tuples = %lu) : ",
-                (double)sizeof(tuple_t) * params->r_size / (1024.0 * 1024.0),
-                params->r_size);
+        printf("Creating relation R (%s = %.1lf, size = %.3lf MiB, #tuples = %lu) : ",
+               GEN_MODE == FILL_UNIFORM ? "uniform" : "zipf",
+               GEN_MODE == FILL_UNIFORM ? 1.0 : (double)ZIPF,
+               (double)sizeof(tuple_t) * params->r_size / (1024.0 * 1024.0),
+               params->r_size);
         fflush(stdout);
 #endif
 
+#if GEN_MODE == FILL_UNIFORM
         fill_relation_uniform(&r, params->n_threads);
-        //fill_relation_zipf(&r, params->n_threads, ZIPF);
+#elif GEN_MODE == FILL_ZIPF
+        fill_relation_zipf(&r, params->n_threads, ZIPF);
+#else
         //load_relation(&r, "/mnt/nvme5/moritz/r-64GiB.bin");
+        #error "Invalid GEN_MODE"
+#endif
 
 #if DEBUG
-        printf("OK\nCreating relation S (size = %.3lf MiB, #tuples = %lu) : ",
-                (double)sizeof(tuple_t) * params->s_size / (1024.0 * 1024.0),
-                params->s_size);
+        printf("OK\nCreating relation S (%s = %.1lf, size = %.3lf MiB, #tuples = %lu) : ",
+               GEN_MODE == FILL_UNIFORM ? "uniform" : "zipf",
+               GEN_MODE == FILL_UNIFORM ? 1.0 : (double)ZIPF,
+               (double)sizeof(tuple_t) * params->s_size / (1024.0 * 1024.0),
+               params->s_size);
         fflush(stdout);
 #endif
 
+#if GEN_MODE == FILL_UNIFORM
         fill_relation_uniform(&s, params->n_threads);
-        //fill_relation_zipf(&s, params->n_threads, ZIPF);
+#elif GEN_MODE == FILL_ZIPF
+        fill_relation_zipf(&s, params->n_threads, ZIPF);
+#else
         //load_relation(&s, "/mnt/nvme5/moritz/s-64GiB.bin");
+        #error "Invalid GEN_MODE"
+#endif
 
 #if DEBUG
         printf("OK\n");

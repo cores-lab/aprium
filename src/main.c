@@ -23,8 +23,7 @@ int main(int argc, char **argv) {
     parse_args(argc, argv, &params);
 
     /* Init */
-    cxl_alloc(params.cxl_dev1_size, params.cxl_dev2_size, params.cxl_offset,
-              params.my_nid, params.n_nodes, params.r_size, params.s_size);
+    cxl_alloc(params.my_nid, params.n_nodes, params.r_size, params.s_size);
     mem_alloc(params.r_size, params.s_size, params.n_threads);
     relation_t slice_r;
     relation_t slice_s;

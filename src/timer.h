@@ -3,6 +3,8 @@
 #include <stdint.h>
 #include <sys/time.h>
 
+#include "config.h"
+
 #if !defined(__x86_64__)
 #warning No supported architecture found -- timers will return junk.
 #endif
@@ -18,7 +20,7 @@ struct timing {
 };
 typedef struct timing timing_t;
 
-static void print_timing(size_t n_tuples, timing_t *timing)
+static void print_timing(size_t r_size, size_t s_size, size_t n_threads, size_t n_tuples, timing_t *timing)
 {
     uint64_t total = timing->end - timing->start;
     uint64_t part_distr = timing->part_distr - timing->start;
@@ -28,11 +30,9 @@ static void print_timing(size_t n_tuples, timing_t *timing)
     double per_tuple = total / n_tuples;
 
 #if DEBUG
-    printf("n_tuples,total,part_distr,part_assign,part_local,build_probe,"
-           "per_tuple\n");
+    printf("r_tuples,s_tuples,fill,fill_param,n_threads,radix_bits,n_tuples,total,part_distr,part_assign,part_local,build_probe,per_tuple\n");
 #endif
-    printf("%lu,%lu,%lu,%lu,%lu,%lu,%.4lf\n", n_tuples, total, part_distr,
-            part_assign, part_local, build_probe, per_tuple);
+    printf("%lu,%lu,%s,%.1lf,%lu,%u,%lu,%lu,%lu,%lu,%lu,%lu,%.4lf\n", r_size, s_size, (GEN_MODE == FILL_ZIPF) ? "zipf" : "uniform", (GEN_MODE == FILL_ZIPF)? ZIPF : 0.0, n_threads, N_RADIX_BITS, n_tuples, total, part_distr, part_assign, part_local, build_probe, per_tuple);
 }
 
 static inline uint64_t cpu_cycle_count() {

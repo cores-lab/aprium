@@ -39,79 +39,62 @@ typedef struct mem mem_t;
 
 static mem_t mem = { 0 };
 
-/* Init */
-void *cxl_map(size_t size1, size_t size2, size_t offset) {
-    char const *dev1 = "/dev/dax0.0";
-    char const *dev2 = "/dev/dax1.0";
-
-    uint64_t total = size1 + size2;
-    uint64_t align = 2ULL * 1024 * 1024; /* 2 MiB */
-
-    int fd1 = open(dev1, O_RDWR);
-    BUG_ON(fd1 < 0);
-    int fd2 = open(dev2, O_RDWR);
-    BUG_ON(fd2 < 0);
-
+typedef struct {
+    char const *path;
     size_t size;
-    int prot;
-    int flags;
+} dax_device_t;
 
-    size = total + align;
-    prot = PROT_NONE;
-    flags = MAP_PRIVATE | MAP_ANONYMOUS;
-    void *reserve = mmap(NULL, size, prot, flags, -1, 0);
-    BUG_ON(reserve == MAP_FAILED);
+/* Init */
+void *cxl_map(void) {
+    dax_device_t devices[] = {
+        {"/dev/dax0.0", 260650827776ULL},
+        {"/dev/dax1.0", 289104986112ULL},
+        {"/dev/dax2.0", 274877906944ULL}
+    };
 
-    uintptr_t rbase = (uintptr_t)reserve;
-    uintptr_t abase = round_up(rbase, align);
-    BUG_ON(abase + total > rbase + size);
+    size_t num_devices = sizeof(devices) / sizeof(devices[0]);
+    size_t total_size = 0;
 
-    size_t prefix = abase - rbase;
-    if (prefix) {
-        munmap((void *)rbase, prefix);
+    for (size_t i = 0; i < num_devices; i++) {
+        total_size += devices[i].size;
     }
 
-    uintptr_t suffix_addr = abase + total;
-    size_t suffix = (rbase + size) - suffix_addr;
-    if (suffix) {
-        munmap((void *)suffix_addr, suffix);
+    void *base = mmap(NULL, total_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    BUG_ON(base == MAP_FAILED);
+
+    size_t offset = 0;
+    for (size_t i = 0; i < num_devices; i++) {
+        int fd = open(devices[i].path, O_RDWR);
+        BUG_ON(fd < 0);
+        void *target = (uint8_t *)base + offset;
+        void *addr = mmap(target, devices[i].size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+        BUG_ON(addr == MAP_FAILED);
+        close(fd);
+        offset += devices[i].size;
     }
 
-    prot = PROT_READ | PROT_WRITE;
-    flags = MAP_SHARED | MAP_FIXED;
-    void *mem1 = mmap((void *)abase, size1, prot, flags, fd1, 0);
-    BUG_ON(mem1 == MAP_FAILED);
-    void *mem2 = mmap((void *)(abase + size1), size2, prot, flags, fd2, 0);
-    BUG_ON(mem2 == MAP_FAILED);
+    mem.base = base;
+    mem.size = total_size;
 
-    close(fd1);
-    close(fd2);
-
-    mem.base = (void *)(abase);
-    mem.size = total;
-
-    return (void *)(abase + offset);
+    return base;
 }
 
 static size_t tmp_size(size_t n_tuples, size_t n_nodes) {
-    // TODO: here we assume uniform relations
-    size_t tmp = round_up((n_tuples / n_nodes) * sizeof(tuple_t) + RELATION_PADDING, CACHELINE_SIZE);
+    // TODO: this is a pessimistic view (alloc as if one machine does all the work)
+    size_t tmp = round_up(n_tuples * sizeof(tuple_t) + RELATION_PADDING, CACHELINE_SIZE);
     return tmp * n_nodes;
 }
 
-void cxl_alloc(size_t size1, size_t size2, size_t offset, size_t my_nid,
-               size_t n_nodes, size_t r_tuples, size_t s_tuples)
-{
+void cxl_alloc(size_t my_nid, size_t n_nodes, size_t r_tuples, size_t s_tuples) {
     bool const is_coordinator_node = (my_nid == COORDINATION_NODE);
 
-    void *base = cxl_map(size1, size2, offset);
+    void *base = cxl_map();
     size_t bytes = 0;
 
     size_t barrier = n_nodes * sizeof(barrier_t);
     size_t r_size = round_up(r_tuples * sizeof(tuple_t), CACHELINE_SIZE);
     size_t s_size = round_up(s_tuples * sizeof(tuple_t), CACHELINE_SIZE);
-    size_t global_hist = round_up(FANOUT_PASS1 * sizeof(uint64_t), CACHELINE_SIZE);
-    size_t node_hist = global_hist * n_nodes;
+    size_t node_hist = round_up(FANOUT_PASS1 * sizeof(uint64_t), CACHELINE_SIZE) * n_nodes;
     size_t offs = round_up((FANOUT_PASS1 + 1) * sizeof(uint64_t), CACHELINE_SIZE) * n_nodes;
     size_t tmp_r = tmp_size(r_tuples, n_nodes);
     size_t tmp_s = tmp_size(s_tuples, n_nodes);

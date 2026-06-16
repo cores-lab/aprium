@@ -837,9 +837,10 @@ uint64_t join_relations(relation_t *r, relation_t *s, param_t *params) {
     offset_r = cxl_p1_remote_offs_r();
     offset_s = cxl_p1_remote_offs_s();
 
-    // TODO: here we assume uniform relations
+    // TODO: here we assume symmetrical relations
     size_t slice;
-    slice = params->r_size / params->n_nodes;
+    size_t bigger = params->r_size > params->s_size ? params->r_size : params->s_size;
+    slice = bigger;
     bytes = round_up(slice * sizeof(tuple_t) + RELATION_PADDING, CACHELINE_SIZE);
     tmp_stride = bytes / sizeof(tuple_t);
     tmp_r = cxl_p1_remote_tmp_r();
@@ -898,7 +899,7 @@ uint64_t join_relations(relation_t *r, relation_t *s, param_t *params) {
     }
 
 #if PERF
-    print_timing(matches, &args[0].timing);
+    print_timing(params->r_size, params->s_size, params->n_threads, matches, &args[0].timing);
 #endif
 
     /* Clean-up */

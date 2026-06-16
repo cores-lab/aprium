@@ -52,14 +52,14 @@ void mem_alloc(size_t r_tuples, size_t s_tuples, size_t n_threads) {
     size_t p1_part_assign = round_up(FANOUT_PASS1 * sizeof(uint8_t), CACHELINE_SIZE);
 
     /* per thread */
-    // TODO: here we assume uniform relations
-    // TODO: here we assume R and S are same size
-    // TODO: here we assume cacheline alignment
+    // TODO: this is a pessimistic view (one thread does all the work)
+    // TODO: here we assume symmetrical relations
+    size_t bigger = r_tuples > s_tuples ? r_tuples : s_tuples;
     size_t per_thread = 4 * (round_up(2 * sizeof(uint64_t) * FANOUT_PASS1, CACHELINE_SIZE)
         + round_up(1 * sizeof(uint64_t) * FANOUT_PASS2, CACHELINE_SIZE)
         + round_up(2 * sizeof(uint64_t) * (FANOUT_PASS2+1), CACHELINE_SIZE)
         + round_up(1 * 144 * FANOUT_PASS1, CACHELINE_SIZE)
-        + round_up((r_tuples / n_threads) * sizeof(tuple_t), CACHELINE_SIZE))
+        + round_up((bigger / n_threads) * sizeof(tuple_t), CACHELINE_SIZE))
         + round_up(10 * L1_CACHE_SIZE, CACHELINE_SIZE);
 
     /* allocator metadata */

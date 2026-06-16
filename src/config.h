@@ -56,9 +56,13 @@ static_assert(N_RADIX_BITS_PASS1 < 16);
 #define P_TUPLES (P_BYTES / sizeof(tuple_t))
 #define PADDING_TUPLES (P_TUPLES * (FANOUT_PASS2 + 1))
 #define RELATION_PADDING (PADDING_TUPLES * FANOUT_PASS1 * sizeof(tuple_t))
-#define ZIPF 0.0
-static_assert(ZIPF >= 0 && ZIPF <= 1.5);
 #define OVERALLOC 2.0
+
+#define FILL_UNIFORM 0
+#define FILL_ZIPF    1
+#define GEN_MODE FILL_UNIFORM
+#define ZIPF 0.0
+static_assert(ZIPF >= 0.0 && ZIPF <= 1.5);
 
 /* Helper */
 #define BUG_ON(cond)                                         \
