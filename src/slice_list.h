@@ -17,8 +17,8 @@ struct slice {
     tuple_t *tuples;
     size_t n_tuples;
     slice_t *next;
-    bool is_compressed;
-    uint8_t compressed_radix;
+    bool is_remote;
+    uint64_t partition;
 };
 
 struct slice_list {

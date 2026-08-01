@@ -11,7 +11,6 @@
 
 /* Hardware */
 #define N_CPUS 128
-static_assert(N_CPUS >= 2);
 static uint8_t const CPU_MAPPING[] = {
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
     10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
@@ -37,14 +36,11 @@ static_assert(sizeof(CPU_MAPPING) == sizeof(CPU_MAPPING[0]) * N_CPUS);
 #define COORDINATION_THREAD 0
 
 /* Join */
-#define N_RADIX_BITS 18
-#define N_PASSES 2
-static_assert(N_PASSES == 2);
-#define N_RADIX_BITS_PASS1 (N_RADIX_BITS / N_PASSES)
-#define N_RADIX_BITS_PASS2 (N_RADIX_BITS - N_RADIX_BITS_PASS1)
+#define N_RADIX_BITS_PASS1 9
+#define N_RADIX_BITS_PASS2 9
+#define N_RADIX_BITS (N_RADIX_BITS_PASS1 + N_RADIX_BITS_PASS2)
 static_assert(N_RADIX_BITS_PASS1 >= 8);
-static_assert(N_RADIX_BITS_PASS1 < 16);
-#define COMPRESSED_TUPLE_SIZE 15
+#define COMPRESSED_TUPLE_SIZE (sizeof(tuple_t) - N_RADIX_BITS_PASS1/8)
 #define FANOUT_PASS1 (1 << N_RADIX_BITS_PASS1)
 #define FANOUT_PASS2 (1 << N_RADIX_BITS_PASS2)
 /* Padding mem layout:
@@ -58,11 +54,8 @@ static_assert(N_RADIX_BITS_PASS1 < 16);
 #define RELATION_PADDING (PADDING_TUPLES * FANOUT_PASS1 * sizeof(tuple_t))
 #define OVERALLOC 2.0
 
-#define FILL_UNIFORM 0
-#define FILL_ZIPF    1
-#define GEN_MODE FILL_UNIFORM
-#define ZIPF 0.0
-static_assert(ZIPF >= 0.0 && ZIPF <= 1.5);
+#define UNIFORM 0
+#define ZIPF    1
 
 /* Helper */
 #define BUG_ON(cond)                                         \

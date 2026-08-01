@@ -1,1 +1,1 @@
-Parallel Radix Join
+Accelerated Parallel Radix-Join over Incoherent Uniform Memory

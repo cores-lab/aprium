@@ -4,8 +4,8 @@
 struct param {
     size_t r_size;
     size_t s_size;
-    char * r_path;
-    char * s_path;
+    int fill_mode;
+    double zipf_alpha;
     size_t n_threads;
     size_t n_nodes;
     size_t my_nid;

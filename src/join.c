@@ -20,14 +20,10 @@ typedef struct {
     alignas(CACHELINE_SIZE)
     relation_t r;
     uint64_t *hist_r;
-    uint64_t *offset_r;
-    size_t offset_stride;
     tuple_t *tmp_r;
-    size_t tmp_stride;
     size_t r_total_tuples;
     relation_t s;
     uint64_t *hist_s;
-    uint64_t *offset_s;
     tuple_t *tmp_s;
     size_t s_total_tuples;
     task_queue_t *join_queue;
@@ -49,20 +45,21 @@ typedef struct {
     relation_t rel;
     size_t total_tuples;
     size_t my_tid;
+    size_t n_threads;
     size_t my_nid;
+    size_t n_nodes;
     pthread_barrier_t *barrier;
     uint64_t *thread_hist;
     uint64_t *node_hist;
     uint64_t *local_offs;
-    uint64_t *remote_offs;
     size_t offset_stride;
     tuple_t *local_tmp;
     tuple_t *remote_tmp;
 } part_t;
 
-/* Software write-combining buffer per partition (L1 cache optimized) */
+/* Software write-combining buffer per partition */
 typedef struct {
-    uint8_t buf[2 * CACHELINE_SIZE];        // Safely fits up to 78 bytes + 16-byte SIMD shift margin
+    alignas(CACHELINE_SIZE) uint8_t buf[2 * CACHELINE_SIZE];        // Safely fits up to 78 bytes + 16-byte SIMD shift margin
     size_t bytes_used;
     size_t cxl_byte_offset;  // Absolute byte offset in the CXL remote memory
 } wc_buffer_t;
@@ -168,24 +165,35 @@ radix_partition(slice_list_t * restrict in,
                 uint64_t * restrict hist,
                 uint64_t const shift_bits,
                 uint64_t const radix_bits,
-                size_t tid)
+                size_t tid,
+                size_t n_threads,
+                uint64_t * restrict remote_thread_hist)
 {
     size_t const fanout = 1 << radix_bits;
     uint64_t const mask = (fanout - 1) << shift_bits;
     uint64_t compressed_shift = shift_bits - 8;
     uint64_t compressed_mask = (fanout - 1) << compressed_shift;
 
+    size_t const pass1_fanout = 1 << N_RADIX_BITS_PASS1;
+    size_t const hist_stride = round_up(pass1_fanout, CACHELINE_SIZE / sizeof(uint64_t));
+
     uint64_t *dst = mem_for(tid, fanout * sizeof(uint64_t));
 
     /* 1. Count tuples per partition */
     slice_t *slice = in->head;
     while (slice) {
-        if (slice->is_compressed) {
+        if (slice->is_remote) {
             uint8_t *remote_bytes = (uint8_t *)slice->tuples;
-            for (size_t i = 0; i < slice->n_tuples; i++) {
-                uint8_t *src = remote_bytes + (i * COMPRESSED_TUPLE_SIZE);
-                size_t idx = hash(*(uint32_t*)src, compressed_mask, compressed_shift);
-                hist[idx]++;
+            for (size_t t = 0; t < n_threads; t++) {
+                uint64_t count = remote_thread_hist[t * hist_stride + slice->partition];
+                if (count == 0) continue;
+
+                for (size_t i = 0; i < count; i++) {
+                    uint8_t *src = remote_bytes + (i * COMPRESSED_TUPLE_SIZE);
+                    size_t idx = hash(*(uint32_t*)src, compressed_mask, compressed_shift);
+                    hist[idx]++;
+                }
+                remote_bytes += round_up(count * COMPRESSED_TUPLE_SIZE, CACHELINE_SIZE);
             }
         } else {
             for (size_t i = 0; i < slice->n_tuples; i++) {
@@ -205,29 +213,28 @@ radix_partition(slice_list_t * restrict in,
 
     /* 3. Copy/Decompress tuples to their corresponding partitions */
     slice = in->head;
-    __m128i cr = _mm_set_epi64x(0, slice->compressed_radix);
+    __m128i cr = _mm_set_epi64x(0, (uint8_t)(slice->partition));
 
     while (slice) {
-        if (slice->is_compressed) {
+        if (slice->is_remote) {
             uint8_t *remote_bytes = (uint8_t *)slice->tuples;
-            for(size_t i = 0; i < slice->n_tuples; i++) {
-                uint8_t *src = remote_bytes + (i * COMPRESSED_TUPLE_SIZE);
-                size_t idx = hash(*(uint32_t*)src, compressed_mask, compressed_shift);
+            for (size_t t = 0; t < n_threads; t++) {
+                // USE compressed_radix instead of partition_idx
+                uint64_t count = remote_thread_hist[t * hist_stride + slice->partition];
+                if (count == 0) continue;
 
-                // 1. Load 16 bytes (15 bytes of tuple + 1 garbage byte from next tuple)
-                __m128i t = _mm_loadu_si128((const __m128i*)src);
+                for(size_t i = 0; i < count; i++) {
+                    uint8_t *src = remote_bytes + (i * COMPRESSED_TUPLE_SIZE);
+                    size_t idx = hash(*(uint32_t*)src, compressed_mask, compressed_shift);
 
-                // 2. Shift entire 128-bit vector left by 1 byte
-                // This drops the garbage byte off the end, aligns the 15-byte tuple
-                // to the top 15 bytes, and sets byte 0 to 0x00
-                t = _mm_slli_si128(t, 1);
+                    __m128i t_vec = _mm_loadu_si128((const __m128i*)src);
+                    t_vec = _mm_slli_si128(t_vec, 1);
+                    t_vec = _mm_or_si128(t_vec, cr);
+                    _mm_store_si128((__m128i*)&out[dst[idx]], t_vec);
 
-                // 3. Drop the compressed radix into the 0x00 hole at byte 0
-                t = _mm_or_si128(t, cr);
-
-                // 4. Store the reconstructed 16-byte tuple
-                _mm_storeu_si128((__m128i*)&out[dst[idx]], t);
-                ++dst[idx];
+                    ++dst[idx];
+                }
+                remote_bytes += round_up(count * COMPRESSED_TUPLE_SIZE, CACHELINE_SIZE);
             }
         } else {
             for(size_t i = 0; i < slice->n_tuples; i++) {
@@ -245,7 +252,10 @@ serial_radix_partition(task_t * const task,
                        task_queue_t *queue,
                        uint64_t const shift_bits,
                        uint64_t const radix_bits,
-                       size_t tid)
+                       size_t tid,
+                       size_t n_threads,
+                       uint64_t * restrict remote_thread_hist_r,
+                       uint64_t * restrict remote_thread_hist_s)
 {
     size_t offset_r = 0;
     size_t offset_s = 0;
@@ -256,8 +266,8 @@ serial_radix_partition(task_t * const task,
     uint64_t *hist_r = mem_for(tid, (fanout + 1) * sizeof(uint64_t));
     uint64_t *hist_s = mem_for(tid, (fanout + 1) * sizeof(uint64_t));
 
-    radix_partition(&task->slices_r, tmp_r, hist_r, shift_bits, radix_bits, tid);
-    radix_partition(&task->slices_s, tmp_s, hist_s, shift_bits, radix_bits, tid);
+    radix_partition(&task->slices_r, tmp_r, hist_r, shift_bits, radix_bits, tid, n_threads, remote_thread_hist_r);
+    radix_partition(&task->slices_s, tmp_s, hist_s, shift_bits, radix_bits, tid, n_threads, remote_thread_hist_s);
 
     for(size_t i = 0; i < fanout; i++) {
         if (hist_r[i] > 0 && hist_s[i] > 0) {
@@ -294,8 +304,8 @@ static void compute_local_hist(arg_t *args) {
 
     size_t stride = round_up(fanout, CACHELINE_SIZE / sizeof(uint64_t));
 
-    uint64_t *my_hist_r = &mem_p1_thread_hist_r()[args->my_tid * stride];
-    uint64_t *my_hist_s = &mem_p1_thread_hist_s()[args->my_tid * stride];
+    uint64_t *my_hist_r = &cxl_p1_thread_hist_r()[(args->my_nid * args->n_threads + args->my_tid) * stride];
+    uint64_t *my_hist_s = &cxl_p1_thread_hist_s()[(args->my_nid * args->n_threads + args->my_tid) * stride];
 
     for (size_t t = 0; t < args->r.n_tuples; t++) {
         size_t p = hash(args->r.tuples[t].key, mask, ignore_bits);
@@ -306,6 +316,9 @@ static void compute_local_hist(arg_t *args) {
         size_t p = hash(args->s.tuples[t].key, mask, ignore_bits);
         my_hist_s[p]++;
     }
+
+    cache_wb(my_hist_r, fanout * sizeof(uint64_t), false);
+    cache_wb(my_hist_s, fanout * sizeof(uint64_t), true);
 }
 
 static void publish_node_hist(arg_t *args) {
@@ -317,8 +330,8 @@ static void publish_node_hist(arg_t *args) {
     uint64_t *my_node_hist_s = &cxl_p1_node_hist_s()[args->my_nid * stride];
 
     for (size_t t = 0; t < args->n_threads; t++) {
-        uint64_t *t_hist_r = &mem_p1_thread_hist_r()[t * stride];
-        uint64_t *t_hist_s = &mem_p1_thread_hist_s()[t * stride];
+        uint64_t *t_hist_r = &cxl_p1_thread_hist_r()[(args->my_nid * args->n_threads + t) * stride];
+        uint64_t *t_hist_s = &cxl_p1_thread_hist_s()[(args->my_nid * args->n_threads + t) * stride];
 
         for (size_t p = 0; p < fanout; p++) {
             my_node_hist_r[p] += t_hist_r[p];
@@ -398,106 +411,78 @@ static void compute_part_assign(arg_t *args) {
 }
 
 static uint64_t *compute_part_offs(part_t *part) {
-    size_t const fanout = 1 << N_RADIX_BITS_PASS1;
-    size_t const stride = round_up(fanout, CACHELINE_SIZE / sizeof(uint64_t));
+size_t const fanout = 1 << N_RADIX_BITS_PASS1;
+    size_t const hist_stride = round_up(fanout, CACHELINE_SIZE / sizeof(uint64_t));
 
     uint64_t *offs = mem_for(part->my_tid, fanout * sizeof(uint64_t));
-    uint64_t *node_hist = part->node_hist;
     uint8_t  *part_assign = mem_p1_part_assign();
 
-    uint64_t local_sum = 0; // counts in tuples
-    uint64_t remote_sum = 0; // counts in compressed tuples
+    uint64_t local_sum = 0;         // Offsets in local memory (tuples)
+    uint64_t global_cxl_sum = 0;    // Offsets in shared CXL memory (bytes)
     size_t local_idx = 0;
 
     for (size_t p = 0; p < fanout; p++) {
-        if (part_assign[p] == part->my_nid) {
+        uint8_t owner = part_assign[p];
+
+        if (owner == part->my_nid) {
+            // Compute base local offset
             offs[p] = local_sum + (local_idx * PADDING_TUPLES);
-            local_sum += node_hist[p];
+
+            // CONDENSE: The coordinator thread captures this base node-wide offset directly
+            if (part->my_tid == COORDINATION_THREAD) {
+                part->local_offs[local_idx] = offs[p];
+            }
+
+            local_sum += part->node_hist[p];
+
+            // Advance past preceding threads on THIS node
+            for (size_t t = 0; t < part->my_tid; t++) {
+                offs[p] += part->thread_hist[(part->my_nid * part->n_threads + t) * hist_stride + p];
+            }
             local_idx++;
-        } else {
-            offs[p] = remote_sum;
-            remote_sum += node_hist[p];
+        }
+
+        // ALWAYS calculate and increment global CXL space to keep all nodes fully synchronized
+        for (size_t n = 0; n < part->n_nodes; n++) {
+            if (n == owner) continue; // Owner writes locally, not to CXL
+
+            for (size_t t = 0; t < part->n_threads; t++) {
+                uint64_t count = part->thread_hist[(n * part->n_threads + t) * hist_stride + p];
+                size_t bytes = round_up(count * COMPRESSED_TUPLE_SIZE, CACHELINE_SIZE);
+
+                // If this is our remote contribution, assign our offset
+                if (owner != part->my_nid && n == part->my_nid && t == part->my_tid) {
+                    offs[p] = global_cxl_sum;
+                }
+                global_cxl_sum += bytes;
+            }
         }
     }
 
-    // coordinator skips this -> has global offs
-    for (size_t t = 0; t < part->my_tid; t++) {
-        uint64_t *thread_hist = &part->thread_hist[t * stride];
-        for (size_t p = 0; p < fanout; p++) {
-            if (part_assign[p] == part->my_nid) {
-                offs[p] += thread_hist[p];
-            } else {
-                offs[p] += thread_hist[p];
-            }
-        }
+    // CONDENSE: Store the final guard array bound element exclusively from the coordinator thread
+    if (part->my_tid == COORDINATION_THREAD) {
+        part->local_offs[local_idx] = local_sum + (local_idx * PADDING_TUPLES);
     }
 
     return offs;
 }
 
-static void publish_global_offs(part_t *part, uint64_t *offs) {
-    size_t const fanout = 1 << N_RADIX_BITS_PASS1;
-    size_t const stride = round_up(fanout + 1, CACHELINE_SIZE / sizeof(uint64_t));
-
-    uint64_t *local_offs = part->local_offs;
-    uint64_t *my_remote_offs = &part->remote_offs[part->my_nid * stride];
-
-    uint64_t *node_hist = part->node_hist;
-    uint8_t  *part_assign = mem_p1_part_assign();
-
-    uint64_t local_sum = 0;
-    uint64_t remote_sum = 0;
-    size_t local_idx = 0;
-    size_t remote_idx = 0;
-
-    for (size_t p = 0; p < fanout; p++) {
-        if (part_assign[p] == part->my_nid) {
-            local_offs[local_idx++] = offs[p];
-            local_sum += node_hist[p];
-        } else {
-            my_remote_offs[remote_idx++] = offs[p];
-            remote_sum += node_hist[p];
-        }
-    }
-
-    local_offs[local_idx] = local_sum + (local_idx * PADDING_TUPLES);
-    my_remote_offs[remote_idx] = remote_sum;
-
-    cache_wb(my_remote_offs, stride * sizeof(uint64_t), true);
-}
-
-static inline void store512_unaligned(uint8_t *src, uint8_t *dst) {
-#if defined(__AVX512F__)
-    __m512i v = _mm512_loadu_si512((__m512i const *)src);
-    _mm512_storeu_si512((__m512i *)dst, v);
-#elif defined(__AVX2__)
-    __m256i v0 = _mm256_loadu_si256((__m256i const *)(src + 0));
-    __m256i v1 = _mm256_loadu_si256((__m256i const *)(src + 32));
-    _mm256_storeu_si256((__m256i *)(dst + 0), v0);
-    _mm256_storeu_si256((__m256i *)(dst + 32), v1);
-#else
-    __m128i v0 = _mm_loadu_si128((__m128i const *)(src + 0));
-    __m128i v1 = _mm_loadu_si128((__m128i const *)(src + 16));
-    __m128i v2 = _mm_loadu_si128((__m128i const *)(src + 32));
-    __m128i v3 = _mm_loadu_si128((__m128i const *)(src + 48));
-    _mm_storeu_si128((__m128i *)(dst + 0), v0);
-    _mm_storeu_si128((__m128i *)(dst + 16), v1);
-    _mm_storeu_si128((__m128i *)(dst + 32), v2);
-    _mm_storeu_si128((__m128i *)(dst + 48), v3);
-#endif
+static inline void store512(uint8_t *src, uint8_t *dst) {
+    __m512i v = _mm512_load_si512((__m512i const *)src);
+    _mm512_store_si512((__m512i *)dst, v);
 }
 
 static void stream_tuples_to_parts(part_t *part, uint64_t *offs) {
     size_t const fanout = 1 << N_RADIX_BITS_PASS1;
     uint64_t const ignore_bits = 0;
     uint64_t const mask = (fanout - 1) << ignore_bits;
-    
+
     uint8_t *part_assign = mem_p1_part_assign();
 
     wc_buffer_t *wc_bufs = mem_for(part->my_tid, fanout * sizeof(wc_buffer_t));
     for (size_t p = 0; p < fanout; p++) {
         if (part_assign[p] != part->my_nid) {
-            wc_bufs[p].cxl_byte_offset = offs[p] * COMPRESSED_TUPLE_SIZE;
+            wc_bufs[p].cxl_byte_offset = offs[p];
             wc_bufs[p].bytes_used = 0;
         }
     }
@@ -512,8 +497,8 @@ static void stream_tuples_to_parts(part_t *part, uint64_t *offs) {
         if (part_assign[p] == part->my_nid) {
             // Local write: regular store
             size_t idx = offs[p]++;
-            __m128i t = _mm_loadu_si128((__m128i const *)&rel[i]);
-            _mm_storeu_si128((__m128i *)&local_tmp[idx], t);
+            __m128i t = _mm_load_si128((__m128i const *)&rel[i]);
+            _mm_store_si128((__m128i *)&local_tmp[idx], t);
         } else {
             // Remote write: compression, write-combining store
             wc_buffer_t *wc = &wc_bufs[p];
@@ -529,7 +514,7 @@ static void stream_tuples_to_parts(part_t *part, uint64_t *offs) {
             if (wc->bytes_used >= CACHELINE_SIZE) {
                 uint8_t *cxl_dest = remote_tmp + wc->cxl_byte_offset;
 
-                store512_unaligned(wc->buf, cxl_dest);
+                store512(wc->buf, cxl_dest);
 
                 wc->cxl_byte_offset += CACHELINE_SIZE;
                 wc->bytes_used -= CACHELINE_SIZE;
@@ -560,108 +545,123 @@ static void stream_tuples_to_parts(part_t *part, uint64_t *offs) {
 static void parallel_radix_partition(part_t * const part) {
     uint64_t *offs = compute_part_offs(part);
 
-    if (part->my_tid == COORDINATION_THREAD) {
-        publish_global_offs(part, offs);
-    }
-
     stream_tuples_to_parts(part, offs);
 }
 
 static void prepare_part_tasks(arg_t *args) {
     size_t const fanout = 1 << N_RADIX_BITS_PASS1;
-    size_t const stride = round_up(fanout + 1, CACHELINE_SIZE / sizeof(uint64_t));
+    size_t const hist_stride = round_up(fanout, CACHELINE_SIZE / sizeof(uint64_t));
     uint8_t *part_assign = mem_p1_part_assign();
-    // TODO: this assumes 2 nodes
-    size_t remote_nid = (args->my_nid + 1) % 2;
 
     uint64_t *local_offs_r = mem_p1_local_offs_r();
     uint64_t *local_offs_s = mem_p1_local_offs_s();
-    uint64_t *remote_offs_r = &cxl_p1_remote_offs_r()[remote_nid * stride];
-    uint64_t *remote_offs_s = &cxl_p1_remote_offs_s()[remote_nid * stride];
 
-    cache_inv(remote_offs_r, stride * sizeof(uint64_t), false);
-    cache_inv(remote_offs_s, stride * sizeof(uint64_t), true);
+    // Base pointers for all thread histograms across all nodes
+    uint64_t *all_hists_r = cxl_p1_thread_hist_r();
+    uint64_t *all_hists_s = cxl_p1_thread_hist_s();
 
     tuple_t *local_tmp_r = mem_p1_local_tmp_r();
     tuple_t *local_tmp_s = mem_p1_local_tmp_s();
-    uint8_t *remote_tmp_r = (uint8_t *)&cxl_p1_remote_tmp_r()[remote_nid * args->tmp_stride];
-    uint8_t *remote_tmp_s = (uint8_t *)&cxl_p1_remote_tmp_s()[remote_nid * args->tmp_stride];
 
-    size_t idx = 0;
+    // Shared CXL buffers (no longer node-specific)
+    uint8_t *remote_tmp_r = (uint8_t *)cxl_p1_remote_tmp_r();
+    uint8_t *remote_tmp_s = (uint8_t *)cxl_p1_remote_tmp_s();
+
+    uint64_t global_cxl_sum_r = 0;
+    uint64_t global_cxl_sum_s = 0;
+    size_t local_idx = 0;
+
     for (size_t p = 0; p < fanout; p++) {
-        if (part_assign[p] != args->my_nid) {
-            continue;
+        uint8_t owner = part_assign[p];
+
+        // Calculate the total remote bytes/tuples for this partition across ALL non-owner nodes
+        uint64_t p_remote_bytes_r = 0, p_remote_tuples_r = 0;
+        uint64_t p_remote_bytes_s = 0, p_remote_tuples_s = 0;
+
+        for (size_t n = 0; n < args->n_nodes; n++) {
+            if (n == owner) continue;
+            for (size_t t = 0; t < args->n_threads; t++) {
+                uint64_t count_r = all_hists_r[(n * args->n_threads + t) * hist_stride + p];
+                p_remote_bytes_r += round_up(count_r * COMPRESSED_TUPLE_SIZE, CACHELINE_SIZE);
+                p_remote_tuples_r += count_r;
+
+                uint64_t count_s = all_hists_s[(n * args->n_threads + t) * hist_stride + p];
+                p_remote_bytes_s += round_up(count_s * COMPRESSED_TUPLE_SIZE, CACHELINE_SIZE);
+                p_remote_tuples_s += count_s;
+            }
         }
 
-        size_t local_r = local_offs_r[idx + 1] - local_offs_r[idx] - PADDING_TUPLES;
-        size_t local_s = local_offs_s[idx + 1] - local_offs_s[idx] - PADDING_TUPLES;
-        size_t remote_r = remote_offs_r[idx + 1] - remote_offs_r[idx];
-        size_t remote_s = remote_offs_s[idx + 1] - remote_offs_s[idx];
+        // Only create tasks for partitions assigned to this node
+        if (owner == args->my_nid) {
+            size_t local_r = local_offs_r[local_idx + 1] - local_offs_r[local_idx] - PADDING_TUPLES;
+            size_t local_s = local_offs_s[local_idx + 1] - local_offs_s[local_idx] - PADDING_TUPLES;
 
-        size_t count_r = local_r + remote_r;
-        size_t count_s = local_s + remote_s;
+            if ((local_r + p_remote_tuples_r > 0) && (local_s + p_remote_tuples_s > 0)) {
+                task_t *task = task_queue_get_slot(args->part_queue);
+                BUG_ON(!task);
 
-        if (count_r == 0 || count_s == 0) {
-            idx++;
-            continue;
+                // Add Local R slice
+                if (local_r > 0) {
+                    slice_t *slice = slice_alloc();
+                    slice->tuples = &local_tmp_r[local_offs_r[local_idx]];
+                    slice->n_tuples = local_r;
+                    slice->is_remote = false;
+                    slice->partition = p;
+                    slice_list_add(&task->slices_r, slice);
+                }
+
+                // Add Single Contiguous Remote R slice
+                if (p_remote_tuples_r > 0) {
+                    slice_t *slice = slice_alloc();
+                    slice->tuples = (tuple_t *)&remote_tmp_r[global_cxl_sum_r];
+                    slice->n_tuples = p_remote_tuples_r;
+                    slice->is_remote = true;
+                    slice->partition = p;
+                    slice_list_add(&task->slices_r, slice);
+                }
+
+                // Add Local S slice
+                if (local_s > 0) {
+                    slice_t *slice = slice_alloc();
+                    slice->tuples = &local_tmp_s[local_offs_s[local_idx]];
+                    slice->n_tuples = local_s;
+                    slice->is_remote = false;
+                    slice->partition = p;
+                    slice_list_add(&task->slices_s, slice);
+                }
+
+                // Add Single Contiguous Remote S slice
+                if (p_remote_tuples_s > 0) {
+                    slice_t *slice = slice_alloc();
+                    slice->tuples = (tuple_t *)&remote_tmp_s[global_cxl_sum_s];
+                    slice->n_tuples = p_remote_tuples_s;
+                    slice->is_remote = true;
+                    slice->partition = p;
+                    slice_list_add(&task->slices_s, slice);
+                }
+
+                task->r_total_tuples = local_r + p_remote_tuples_r;
+                task->s_total_tuples = local_s + p_remote_tuples_s;
+                task_queue_add(args->part_queue, task);
+            }
+            local_idx++;
         }
 
-        task_t *task = task_queue_get_slot(args->part_queue);
-        BUG_ON(!task);
-
-        uint8_t compressed_radix = (uint8_t)p;
-
-        if (local_r > 0) {
-            slice_t *slice = slice_alloc();
-            BUG_ON(!slice);
-            slice->tuples = &local_tmp_r[local_offs_r[idx]];
-            slice->n_tuples = local_r;
-            slice->is_compressed = false;
-            slice->compressed_radix = compressed_radix;
-            slice_list_add(&task->slices_r, slice);
-        }
-
-        if (remote_r > 0) {
-            slice_t *slice = slice_alloc();
-            BUG_ON(!slice);
-            slice->tuples = (tuple_t *)&remote_tmp_r[remote_offs_r[idx] * COMPRESSED_TUPLE_SIZE];
-            slice->n_tuples = remote_r;
-            slice->is_compressed = true;
-            slice->compressed_radix = compressed_radix;
-            slice_list_add(&task->slices_r, slice);
-        }
-
-        if (local_s > 0) {
-            slice_t *slice = slice_alloc();
-            BUG_ON(!slice);
-            slice->tuples = &local_tmp_s[local_offs_s[idx]];
-            slice->n_tuples = local_s;
-            slice->is_compressed = false;
-            slice->compressed_radix = compressed_radix;
-            slice_list_add(&task->slices_s, slice);
-        }
-
-        if (remote_s > 0) {
-            slice_t *slice = slice_alloc();
-            BUG_ON(!slice);
-            slice->tuples = (tuple_t *)&remote_tmp_s[remote_offs_s[idx] * COMPRESSED_TUPLE_SIZE];
-            slice->n_tuples = remote_s;
-            slice->is_compressed = true;
-            slice->compressed_radix = compressed_radix;
-            slice_list_add(&task->slices_s, slice);
-        }
-
-        task->r_total_tuples = count_r;
-        task->s_total_tuples = count_s;
-        task_queue_add(args->part_queue, task);
-
-        idx++;
+        // Always increment the global offset trackers regardless of assignment
+        global_cxl_sum_r += p_remote_bytes_r;
+        global_cxl_sum_s += p_remote_bytes_s;
     }
 }
 
 void *join_worker(void *arg) {
     arg_t *args = (arg_t *) arg;
     bool const is_coordinator_thread = (args->my_tid == COORDINATION_THREAD);
+
+    local_barrier(args->barrier);
+
+#if PERF
+    args->timing.start = timestamp();
+#endif
 
     compute_local_hist(args);
     local_barrier(args->barrier);
@@ -681,41 +681,35 @@ void *join_worker(void *arg) {
     task_queue_t *part_queue = args->part_queue;
     task_queue_t *join_queue = args->join_queue;
 
-    //global_barrier(args->my_tid, args->barrier);
-
-#if PERF
-    args->timing.start = timestamp();
-#endif
-
     size_t const stride = round_up(FANOUT_PASS1, CACHELINE_SIZE / sizeof(uint64_t));
 
     part_t part;
 
     part.my_tid     = args->my_tid;
+    part.n_threads  = args->n_threads;
     part.my_nid     = args->my_nid;
+    part.n_nodes    = args->n_nodes;
     part.barrier    = args->barrier;
 
     /* Partition R */
     part.rel          = args->r;
     part.total_tuples = args->r_total_tuples;
-    part.thread_hist  = mem_p1_thread_hist_r();
+    part.thread_hist  = cxl_p1_thread_hist_r();
     part.node_hist    = &cxl_p1_node_hist_r()[args->my_nid * stride];
     part.local_offs   = mem_p1_local_offs_r();
-    part.remote_offs  = cxl_p1_remote_offs_r();
     part.local_tmp    = mem_p1_local_tmp_r();
-    part.remote_tmp   = &cxl_p1_remote_tmp_r()[args->my_nid * args->tmp_stride];
+    part.remote_tmp   = cxl_p1_remote_tmp_r();
 
     parallel_radix_partition(&part);
 
     /* Partition S */
     part.rel          = args->s;
     part.total_tuples = args->s_total_tuples;
-    part.thread_hist  = mem_p1_thread_hist_s();
+    part.thread_hist  = cxl_p1_thread_hist_s();
     part.node_hist    = &cxl_p1_node_hist_s()[args->my_nid * stride];
     part.local_offs   = mem_p1_local_offs_s();
-    part.remote_offs  = cxl_p1_remote_offs_s();
     part.local_tmp    = mem_p1_local_tmp_s();
-    part.remote_tmp   = &cxl_p1_remote_tmp_s()[args->my_nid * args->tmp_stride];
+    part.remote_tmp   = cxl_p1_remote_tmp_s();
 
     parallel_radix_partition(&part);
 
@@ -733,11 +727,6 @@ void *join_worker(void *arg) {
     args->timing.part_assign = timestamp();
 #endif
 
-#if N_PASSES==1
-    task_queue_t *swap = join_queue;
-    join_queue = part_queue;
-    part_queue = swap;
-#elif N_PASSES==2
     /* 2nd pass */
 #if DEBUG
     if (is_coordinator_thread) {
@@ -745,17 +734,22 @@ void *join_worker(void *arg) {
     }
     local_barrier(args->barrier);
 #endif
+    size_t const hist_stride = round_up(FANOUT_PASS1, CACHELINE_SIZE / sizeof(uint64_t));
+    size_t remote_nid = (args->my_nid + 1) % 2;
+
+    uint64_t *remote_thread_hist_r = &cxl_p1_thread_hist_r()[remote_nid * args->n_threads * hist_stride];
+    uint64_t *remote_thread_hist_s = &cxl_p1_thread_hist_s()[remote_nid * args->n_threads * hist_stride];
+
     task_t *part_task;
     while ((part_task = task_queue_get_atomic(part_queue))) {
         uint64_t shift = N_RADIX_BITS_PASS1;
         uint64_t radix = N_RADIX_BITS_PASS2;
         size_t tid = args->my_tid;
-        serial_radix_partition(part_task, join_queue, shift, radix, tid);
+        serial_radix_partition(part_task, join_queue, shift, radix, tid, args->n_threads, remote_thread_hist_r, remote_thread_hist_s);
     }
 
     /* Wait until parallel threads add all join tasks */
     local_barrier(args->barrier);
-#endif
 
 #if PERF
     args->timing.part_local = timestamp();
@@ -805,15 +799,10 @@ uint64_t join_relations(relation_t *r, relation_t *s, param_t *params) {
     /* Histograms */
     uint64_t *hist_r;
     uint64_t *hist_s;
-    uint64_t *offset_r;
-    uint64_t *offset_s;
-    size_t offset_stride;
 
     /* Temporary space for partitioning */
     tuple_t *tmp_r;
     tuple_t *tmp_s;
-    // TODO: here we assume R and S are same size
-    size_t tmp_stride;
 
     /* Queues for partition and join tasks */
     task_queue_t *part_queue;
@@ -827,22 +816,9 @@ uint64_t join_relations(relation_t *r, relation_t *s, param_t *params) {
     // TODO: use whatever is bigger from above
     slice_allocator_init(FANOUT_PASS1 * params->n_nodes + (1 << N_RADIX_BITS));
 
-    size_t bytes;
-    hist_r = mem_p1_thread_hist_r();
-    hist_s = mem_p1_thread_hist_s();
+    hist_r = cxl_p1_thread_hist_r();
+    hist_s = cxl_p1_thread_hist_s();
 
-    // TODO: here we assume perfectly symmetrical machines & workloads
-    bytes = round_up((FANOUT_PASS1 + 1) * sizeof(uint64_t), CACHELINE_SIZE);
-    offset_stride = bytes / sizeof(uint64_t);
-    offset_r = cxl_p1_remote_offs_r();
-    offset_s = cxl_p1_remote_offs_s();
-
-    // TODO: here we assume symmetrical relations
-    size_t slice;
-    size_t bigger = params->r_size > params->s_size ? params->r_size : params->s_size;
-    slice = bigger;
-    bytes = round_up(slice * sizeof(tuple_t) + RELATION_PADDING, CACHELINE_SIZE);
-    tmp_stride = bytes / sizeof(tuple_t);
     tmp_r = cxl_p1_remote_tmp_r();
     tmp_s = cxl_p1_remote_tmp_s();
 
@@ -860,22 +836,18 @@ uint64_t join_relations(relation_t *r, relation_t *s, param_t *params) {
         args[i].r.tuples = r->tuples + i * r_slice;
         args[i].r.n_tuples = last ? (r->n_tuples - i * r_slice) : r_slice;
         args[i].hist_r = hist_r;
-        args[i].offset_r = offset_r;
         args[i].tmp_r = tmp_r;
         args[i].r_total_tuples = r->n_tuples;
 
         args[i].s.tuples = s->tuples + i * s_slice;
         args[i].s.n_tuples = last ? (s->n_tuples - i * s_slice) : s_slice;
         args[i].hist_s = hist_s;
-        args[i].offset_s = offset_s;
         args[i].tmp_s = tmp_s;
         args[i].s_total_tuples = s->n_tuples;
 
         args[i].part_queue = part_queue;
         args[i].join_queue = join_queue;
 
-        args[i].offset_stride = offset_stride;
-        args[i].tmp_stride = tmp_stride;
         args[i].barrier = &barrier;
         args[i].my_tid = i;
         args[i].n_threads = params->n_threads;
@@ -899,7 +871,7 @@ uint64_t join_relations(relation_t *r, relation_t *s, param_t *params) {
     }
 
 #if PERF
-    print_timing(params->r_size, params->s_size, params->n_threads, matches, &args[0].timing);
+    print_timing(params, matches, &args[0].timing);
 #endif
 
     /* Clean-up */

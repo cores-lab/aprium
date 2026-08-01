@@ -28,6 +28,8 @@ struct mem {
     barrier_t *barrier; /* one barrier per node */
     tuple_t *gen_r;
     tuple_t *gen_s;
+    uint64_t *thread_hist_r;
+    uint64_t *thread_hist_s;
     uint64_t *node_hist_r;
     uint64_t *node_hist_s;
     uint64_t *offs_r;
@@ -46,35 +48,53 @@ typedef struct {
 
 /* Init */
 void *cxl_map(void) {
+    // dax_device_t devices[] = {
+    //     {"/dev/dax0.0", 260650827776ULL},
+    //     {"/dev/dax1.0", 289104986112ULL},
+    //     {"/dev/dax2.0", 274877906944ULL}
+    // };
+
+    // size_t num_devices = sizeof(devices) / sizeof(devices[0]);
+    // size_t total_size = 0;
+
+    // for (size_t i = 0; i < num_devices; i++) {
+    //     total_size += devices[i].size;
+    // }
+
+    // void *base = mmap(NULL, total_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    // BUG_ON(base == MAP_FAILED);
+
+    // size_t offset = 0;
+    // for (size_t i = 0; i < num_devices; i++) {
+    //     int fd = open(devices[i].path, O_RDWR);
+    //     BUG_ON(fd < 0);
+    //     void *target = (uint8_t *)base + offset;
+    //     void *addr = mmap(target, devices[i].size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+    //     BUG_ON(addr == MAP_FAILED);
+    //     close(fd);
+    //     offset += devices[i].size;
+    // }
+
+    // mem.base = base;
+    // mem.size = total_size;
+
+    // return base;
+
     dax_device_t devices[] = {
-        {"/dev/dax0.0", 260650827776ULL},
-        {"/dev/dax1.0", 289104986112ULL},
-        {"/dev/dax2.0", 274877906944ULL}
+        {"/dev/shm/mock_dax0.0", 64 * (1ULL << 30)},
     };
 
-    size_t num_devices = sizeof(devices) / sizeof(devices[0]);
-    size_t total_size = 0;
+    int fd = open(devices[0].path, O_RDWR | O_CREAT, 0666);
+    BUG_ON(fd < 0);
+    BUG_ON(ftruncate(fd, devices[0].size) != 0);
 
-    for (size_t i = 0; i < num_devices; i++) {
-        total_size += devices[i].size;
-    }
-
-    void *base = mmap(NULL, total_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    void *base = mmap(NULL, devices[0].size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     BUG_ON(base == MAP_FAILED);
 
-    size_t offset = 0;
-    for (size_t i = 0; i < num_devices; i++) {
-        int fd = open(devices[i].path, O_RDWR);
-        BUG_ON(fd < 0);
-        void *target = (uint8_t *)base + offset;
-        void *addr = mmap(target, devices[i].size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
-        BUG_ON(addr == MAP_FAILED);
-        close(fd);
-        offset += devices[i].size;
-    }
+    close(fd);
 
     mem.base = base;
-    mem.size = total_size;
+    mem.size = devices[0].size;
 
     return base;
 }
@@ -85,7 +105,7 @@ static size_t tmp_size(size_t n_tuples, size_t n_nodes) {
     return tmp * n_nodes;
 }
 
-void cxl_alloc(size_t my_nid, size_t n_nodes, size_t r_tuples, size_t s_tuples) {
+void cxl_alloc(size_t my_nid, size_t n_nodes, size_t n_threads, size_t r_tuples, size_t s_tuples) {
     bool const is_coordinator_node = (my_nid == COORDINATION_NODE);
 
     void *base = cxl_map();
@@ -94,6 +114,7 @@ void cxl_alloc(size_t my_nid, size_t n_nodes, size_t r_tuples, size_t s_tuples) 
     size_t barrier = n_nodes * sizeof(barrier_t);
     size_t r_size = round_up(r_tuples * sizeof(tuple_t), CACHELINE_SIZE);
     size_t s_size = round_up(s_tuples * sizeof(tuple_t), CACHELINE_SIZE);
+    size_t thread_hist = round_up(FANOUT_PASS1 * sizeof(uint64_t), CACHELINE_SIZE) * n_threads * n_nodes;
     size_t node_hist = round_up(FANOUT_PASS1 * sizeof(uint64_t), CACHELINE_SIZE) * n_nodes;
     size_t offs = round_up((FANOUT_PASS1 + 1) * sizeof(uint64_t), CACHELINE_SIZE) * n_nodes;
     size_t tmp_r = tmp_size(r_tuples, n_nodes);
@@ -102,6 +123,7 @@ void cxl_alloc(size_t my_nid, size_t n_nodes, size_t r_tuples, size_t s_tuples) 
     bytes += barrier;
     bytes += r_size;
     bytes += s_size;
+    bytes += 2ULL * thread_hist;
     bytes += 2ULL * node_hist;
     bytes += 2ULL * offs;
     bytes += tmp_r;
@@ -133,6 +155,10 @@ void cxl_alloc(size_t my_nid, size_t n_nodes, size_t r_tuples, size_t s_tuples) 
     ptr += r_size;
     mem.gen_s = (tuple_t *)ptr;
     ptr += s_size;
+    mem.thread_hist_r = (uint64_t *)ptr;
+    ptr += thread_hist;
+    mem.thread_hist_s = (uint64_t *)ptr;
+    ptr += thread_hist;
     mem.node_hist_r = (uint64_t *)ptr;
     ptr += node_hist;
     mem.node_hist_s = (uint64_t *)ptr;
@@ -205,6 +231,14 @@ tuple_t *cxl_gen_r(void) {
 
 tuple_t *cxl_gen_s(void) {
     return mem.gen_s;
+}
+
+uint64_t *cxl_p1_thread_hist_r(void) {
+    return mem.thread_hist_r;
+}
+
+uint64_t *cxl_p1_thread_hist_s(void) {
+    return mem.thread_hist_s;
 }
 
 uint64_t *cxl_p1_node_hist_r(void) {
