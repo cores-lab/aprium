@@ -49,6 +49,6 @@ done
 BOOST="/sys/devices/system/cpu/cpufreq/boost"
 echo 0 > "$BOOST"
 
-# Make perf usable.
+# Allow perf.
 echo -1 > /proc/sys/kernel/perf_event_paranoid
 echo 0 > /proc/sys/kernel/nmi_watchdog

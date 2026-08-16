@@ -61,6 +61,7 @@ ssh "$HOST2" "mkdir -p $PROJECT"
 rsync -avz --delete \
   --exclude='.git/' \
   --exclude='data/' \
+  --exclude='obj/' \
   --exclude='bin/' \
   "$PROJECT/" "$HOST2:$PROJECT/"
 

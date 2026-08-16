@@ -63,7 +63,7 @@ def main():
     print("Compiling project...")
     try:
         subprocess.run(["make", "clean"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(["make", "-j"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["make", "-j$(nproc)"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except subprocess.CalledProcessError as e:
         print(f"Compilation failed. Error: {e}")
         sys.exit(1)
@@ -105,7 +105,7 @@ def main():
             print("Executing... ", end="", flush=True)
 
             cmd = [
-                "./bin/prj",
+                "./bin/aprium",
                 "-r", str(r_tuples),
                 "-s", str(s_tuples),
                 "-u",
