@@ -1,7 +1,6 @@
 #include <immintrin.h>
 #include <pthread.h>
 #include <sched.h>
-#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,12 +24,12 @@ static uint64_t mix64(uint64_t x) {
     return x ^ (x >> 31);
 }
 
-static uint64_t next_u64(uint64_t *state) {
+static uint64_t next_uint64(uint64_t *state) {
     *state += PRNG_WEYL_CONST;
     return mix64(*state);
 }
 
-static double u64_to_unit(uint64_t x) {
+static double uint64_to_unit(uint64_t x) {
     // Keep 53 bits for standard IEEE 754 double precision mantissa
     return (x >> 11) * (1.0 / (double)(1ULL << 53));
 }
@@ -58,7 +57,7 @@ static uint64_t gcd64(uint64_t x, uint64_t y) {
 static void *fill_worker_uniform(void *p) {
     fill_uniform_arg_t *a = (fill_uniform_arg_t *)p;
 
-    for (size_t i = a->lo; i < a->hi; ++i) {
+    for (size_t i = a->lo; i < a->hi; i++) {
         a->tuples[i].key = (a->a * i + a->b) % a->n;
         a->tuples[i].rid = 0;
     }
@@ -68,9 +67,10 @@ static void *fill_worker_uniform(void *p) {
 }
 
 void fill_relation_uniform(relation_t *rel, size_t n_threads) {
-    if (n_threads == 0) return;
     size_t n = rel->n_tuples;
-    if (n_threads > n) n_threads = n;
+    if (n_threads > n) {
+        n_threads = n;
+    }
 
     uint64_t seed = (uint64_t)time(NULL) ^ (uint64_t)(uintptr_t)rel;
 
@@ -87,10 +87,12 @@ void fill_relation_uniform(relation_t *rel, size_t n_threads) {
     cpu_set_t set;
     fill_uniform_arg_t args[n_threads];
 
-    size_t base = n / n_threads, rem = n % n_threads, pos = 0;
+    size_t base = n / n_threads;
+    size_t rem = n % n_threads;
+    size_t pos = 0;
 
-    for (size_t t = 0; t < n_threads; ++t) {
-        size_t len = base + (t < rem);
+    for (size_t t = 0; t < n_threads; t++) {
+        size_t len = base + (t < rem ? 1 : 0);
 
         args[t].tuples = rel->tuples;
         args[t].lo = pos;
@@ -100,13 +102,16 @@ void fill_relation_uniform(relation_t *rel, size_t n_threads) {
         args[t].b = b;
 
         int cpu = CPU_MAPPING[t];
-        CPU_ZERO(&set); CPU_SET(cpu, &set);
+        CPU_ZERO(&set);
+        CPU_SET(cpu, &set);
         BUG_ON(pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &set));
         BUG_ON(pthread_create(&tids[t], &attr, fill_worker_uniform, &args[t]));
         pos += len;
     }
 
-    for (size_t t = 0; t < n_threads; ++t) { pthread_join(tids[t], NULL); }
+    for (size_t t = 0; t < n_threads; t++) {
+        pthread_join(tids[t], NULL);
+    }
 }
 
 typedef struct {
@@ -119,10 +124,9 @@ typedef struct {
 
 static void *fill_worker_fk_uniform(void *p) {
     fill_fk_uniform_arg_t *a = (fill_fk_uniform_arg_t *)p;
-    uint64_t rng_state = a->seed;
 
-    for (size_t i = a->lo; i < a->hi; ++i) {
-        a->tuples[i].key = next_u64(&rng_state) % a->r_size;
+    for (size_t i = a->lo; i < a->hi; i++) {
+        a->tuples[i].key = next_uint64(&a->seed) % a->r_size;
         a->tuples[i].rid = 0;
     }
 
@@ -131,9 +135,10 @@ static void *fill_worker_fk_uniform(void *p) {
 }
 
 void fill_relation_fk_uniform(relation_t *rel, size_t n_threads, size_t r_size) {
-    if (n_threads == 0) return;
     size_t n = rel->n_tuples;
-    if (n_threads > n) n_threads = n;
+    if (n_threads > n) {
+        n_threads = n;
+    }
 
     uint64_t base_seed = (uint64_t)time(NULL) ^ (uint64_t)(uintptr_t)rel;
 
@@ -143,10 +148,12 @@ void fill_relation_fk_uniform(relation_t *rel, size_t n_threads, size_t r_size) 
     cpu_set_t set;
     fill_fk_uniform_arg_t args[n_threads];
 
-    size_t base = n / n_threads, rem = n % n_threads, pos = 0;
+    size_t base = n / n_threads;
+    size_t rem = n % n_threads;
+    size_t pos = 0;
 
-    for (size_t t = 0; t < n_threads; ++t) {
-        size_t len = base + (t < rem);
+    for (size_t t = 0; t < n_threads; t++) {
+        size_t len = base + (t < rem ? 1 : 0);
 
         args[t].tuples = rel->tuples;
         args[t].lo = pos;
@@ -155,35 +162,41 @@ void fill_relation_fk_uniform(relation_t *rel, size_t n_threads, size_t r_size) 
         args[t].seed = mix64(base_seed + t);
 
         int cpu = CPU_MAPPING[t];
-        CPU_ZERO(&set); CPU_SET(cpu, &set);
+        CPU_ZERO(&set);
+        CPU_SET(cpu, &set);
         BUG_ON(pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &set));
         BUG_ON(pthread_create(&tids[t], &attr, fill_worker_fk_uniform, &args[t]));
         pos += len;
     }
 
-    for (size_t t = 0; t < n_threads; ++t) { pthread_join(tids[t], NULL); }
+    for (size_t t = 0; t < n_threads; t++) {
+        pthread_join(tids[t], NULL);
+    }
 }
 
 /* Zipfian distribution */
 
 typedef struct {
     tuple_t *tuples;
-    size_t lo, hi;
-    const uint64_t *keys; // random permutation of 0..domain_size-1
-    const double *cdf;    // Zipf CDF over ranks 1..domain_size
+    size_t lo;
+    size_t hi;
+    uint64_t const *keys; // random permutation of 0..domain_size-1
+    double const *cdf;    // Zipf CDF over ranks 1..domain_size
     size_t domain_size;
-    uint64_t rng;
+    uint64_t seed;
 } fill_zipf_arg_t;
 
 static double *make_zipf_cdf(size_t n, double tau) {
-    double *cdf = malloc(n * sizeof(*cdf));
+    double *cdf = malloc(n * sizeof(double));
     BUG_ON(!cdf);
 
     double sum = 0.0;
-    for (size_t k = 1; k <= n; ++k) sum += 1.0 / pow((double)k, tau);
+    for (size_t k = 1; k <= n; k++) {
+        sum += 1.0 / pow((double)k, tau);
+    }
 
     double acc = 0.0;
-    for (size_t k = 1; k <= n; ++k) {
+    for (size_t k = 1; k <= n; k++) {
         acc += (1.0 / pow((double)k, tau)) / sum;
         cdf[k - 1] = acc;
     }
@@ -192,13 +205,15 @@ static double *make_zipf_cdf(size_t n, double tau) {
 }
 
 static uint64_t *make_keys(size_t n, uint64_t *seed) {
-    uint64_t *keys = malloc(n * sizeof(*keys));
+    uint64_t *keys = malloc(n * sizeof(uint64_t));
     BUG_ON(!keys);
 
-    for (size_t i = 0; i < n; ++i) keys[i] = i;
+    for (size_t i = 0; i < n; i++) {
+        keys[i] = i;
+    }
 
-    for (size_t i = n - 1; i > 0; --i) {
-        size_t j = (size_t)(next_u64(seed) % (i + 1));
+    for (size_t i = n - 1; i > 0; i--) {
+        size_t j = (size_t)(next_uint64(seed) % (i + 1));
         uint64_t tmp = keys[i];
         keys[i] = keys[j];
         keys[j] = tmp;
@@ -206,9 +221,10 @@ static uint64_t *make_keys(size_t n, uint64_t *seed) {
     return keys;
 }
 
-static uint64_t sample_zipf(const uint64_t *keys, const double *cdf, size_t n, uint64_t *rng) {
-    double r = u64_to_unit(next_u64(rng));
-    size_t low = 0, high = n - 1;
+static uint64_t sample_zipf(uint64_t const *keys, double const *cdf, size_t n, uint64_t *seed) {
+    double r = uint64_to_unit(next_uint64(seed));
+    size_t low = 0;
+    size_t high = n - 1;
 
     while (low < high) {
         size_t mid = low + (high - low) / 2;
@@ -225,7 +241,7 @@ static void *fill_worker_zipf(void *p) {
     fill_zipf_arg_t *a = (fill_zipf_arg_t *)p;
 
     for (size_t i = a->lo; i < a->hi; ++i) {
-        a->tuples[i].key = sample_zipf(a->keys, a->cdf, a->domain_size, &a->rng);
+        a->tuples[i].key = sample_zipf(a->keys, a->cdf, a->domain_size, &a->seed);
         a->tuples[i].rid = 0;
     }
 
@@ -235,12 +251,14 @@ static void *fill_worker_zipf(void *p) {
 
 void fill_relation_fk_zipf(relation_t *rel, size_t n_threads, size_t domain_size, double tau) {
     size_t n = rel->n_tuples;
-    if (n_threads > n) n_threads = n;
+    if (n_threads > n) {
+        n_threads = n;
+    }
 
-    uint64_t seed = (uint64_t)time(NULL) ^ (uint64_t)(uintptr_t)rel;
+    uint64_t base_seed = (uint64_t)time(NULL) ^ (uint64_t)(uintptr_t)rel;
 
     double *cdf = make_zipf_cdf(domain_size, tau);
-    uint64_t *keys = make_keys(domain_size, &seed);
+    uint64_t *keys = make_keys(domain_size, &base_seed);
 
     pthread_t tids[n_threads];
     pthread_attr_t attr;
@@ -248,10 +266,12 @@ void fill_relation_fk_zipf(relation_t *rel, size_t n_threads, size_t domain_size
     cpu_set_t set;
     fill_zipf_arg_t args[n_threads];
 
-    size_t base = n / n_threads, rem = n % n_threads, pos = 0;
+    size_t base = n / n_threads;
+    size_t rem = n % n_threads;
+    size_t pos = 0;
 
-    for (size_t t = 0; t < n_threads; ++t) {
-        size_t len = base + (t < rem);
+    for (size_t t = 0; t < n_threads; t++) {
+        size_t len = base + (t < rem ? 1 : 0);
 
         args[t].tuples = rel->tuples;
         args[t].lo = pos;
@@ -259,16 +279,19 @@ void fill_relation_fk_zipf(relation_t *rel, size_t n_threads, size_t domain_size
         args[t].keys = keys;
         args[t].cdf = cdf;
         args[t].domain_size = domain_size;
-        args[t].rng = mix64(seed + t + 1);
+        args[t].seed = mix64(base_seed + t);
 
         int cpu = CPU_MAPPING[t];
-        CPU_ZERO(&set); CPU_SET(cpu, &set);
+        CPU_ZERO(&set);
+        CPU_SET(cpu, &set);
         BUG_ON(pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &set));
         BUG_ON(pthread_create(&tids[t], &attr, fill_worker_zipf, &args[t]));
         pos += len;
     }
 
-    for (size_t t = 0; t < n_threads; ++t) { pthread_join(tids[t], NULL); }
+    for (size_t t = 0; t < n_threads; t++) {
+        pthread_join(tids[t], NULL);
+    }
 
     free(keys);
     free(cdf);
@@ -289,15 +312,41 @@ void load_relation(relation_t *rel, char const *filename) {
     BUG_ON(file_size < 0 || (size_t)file_size < rel->n_tuples * sizeof(tuple_t));
 
     BUG_ON(fseeko(fp, 0, SEEK_SET) != 0);
-    size_t got = fread(rel->tuples, 1, rel->n_tuples * sizeof(tuple_t), fp);
+    size_t got = fread(rel->tuples, sizeof(tuple_t), rel->n_tuples, fp);
     fclose(fp);
 
     BUG_ON(got != rel->n_tuples * sizeof(tuple_t));
 }
 
+static void assign_slice(relation_t *slice, relation_t const *rel,
+                         size_t my_nid, size_t n_nodes, size_t shift) {
+    size_t const unit = CACHELINE_SIZE / sizeof(tuple_t);
+    size_t idx = (my_nid + shift) % n_nodes;
+
+    size_t total = rel->n_tuples / unit;
+    size_t tail = rel->n_tuples % unit;
+
+    size_t base = total / n_nodes;
+    size_t rem = total % n_nodes;
+
+    size_t lines = base + (idx < rem ? 1 : 0);
+    size_t my_tuples = lines * unit;
+
+    size_t offs = (idx < rem) ? idx : rem;
+    size_t my_offs = ((idx * base) + offs) * unit;
+
+    if (idx == n_nodes - 1) {
+        my_tuples += tail;
+    }
+
+    slice->tuples   = rel->tuples + my_offs;
+    slice->n_tuples = my_tuples;
+}
+
 /* Slicing */
-void get_slices(relation_t *slice_r, relation_t *slice_s, param_t *params) {
-    relation_t r, s;
+void accquire_slices(relation_t *slice_r, relation_t *slice_s, param_t *params) {
+    relation_t r;
+    relation_t s;
     bool const is_coordinator = (params->my_nid == COORDINATION_NODE);
 
     r.tuples = cxl_gen_r();
@@ -307,35 +356,36 @@ void get_slices(relation_t *slice_r, relation_t *slice_s, param_t *params) {
 
     if (is_coordinator) {
 #if DEBUG
-    printf("Creating build relation R (size = %.3lf MiB, #tuples = %lu) : ",
-           (double)sizeof(tuple_t) * params->r_size / (1024.0 * 1024.0),
-           params->r_size);
-    fflush(stdout);
+        printf("Creating build relation R (size = %.3lf MiB, #tuples = %lu) : ",
+            (double)sizeof(tuple_t) * params->r_size / (1024.0 * 1024.0),
+            params->r_size);
+        fflush(stdout);
 #endif
 
         fill_relation_uniform(&r, params->n_threads);
+        //load_relation(&r, "/path/to/rel");
 
 #if DEBUG
-    printf("OK\n");
+        printf("OK\n");
 #endif
 
 #if DEBUG
-    printf("Creating probe relation S (%s = %.1lf, size = %.3lf MiB, #tuples = %lu) : ",
-           params->fill_mode == UNIFORM ? "uniform" : "zipf",
-           params->fill_mode == UNIFORM ? 0.0 : params->zipf_alpha,
-           (double)sizeof(tuple_t) * params->s_size / (1024.0 * 1024.0),
-           params->s_size);
-    fflush(stdout);
+        printf("Creating probe relation S (%s = %.1lf, size = %.3lf MiB, #tuples = %lu) : ",
+            params->fill_mode == UNIFORM ? "uniform" : "zipf",
+            params->fill_mode == UNIFORM ? 0.0 : params->zipf_alpha,
+            (double)sizeof(tuple_t) * params->s_size / (1024.0 * 1024.0),
+            params->s_size);
+        fflush(stdout);
 #endif
 
-if (params->fill_mode == UNIFORM) {
-    fill_relation_fk_uniform(&s, params->n_threads, params->r_size);
-} else if (params->fill_mode == ZIPF) {
-    fill_relation_fk_zipf(&s, params->n_threads, params->r_size, params->zipf_alpha);
-} else {
-    // load_relation(&s, "/path/to/rel");
-    exit(EXIT_FAILURE);
-}
+        if (params->fill_mode == UNIFORM) {
+            fill_relation_fk_uniform(&s, params->n_threads, params->r_size);
+        } else if (params->fill_mode == ZIPF) {
+            fill_relation_fk_zipf(&s, params->n_threads, params->r_size, params->zipf_alpha);
+        } else {
+            //load_relation(&s, "/path/to/rel");
+            exit(EXIT_FAILURE);
+        }
 
 #if DEBUG
         printf("OK\n");
@@ -344,22 +394,8 @@ if (params->fill_mode == UNIFORM) {
 
     cxl_barrier();
 
-    size_t r_slice = params->r_size / params->n_nodes;
-    size_t s_slice = params->s_size / params->n_nodes;
-
-    size_t r_offset = params->my_nid * r_slice;
-    slice_r->tuples = r.tuples + r_offset;
-    slice_r->n_tuples = (params->my_nid == params->n_nodes - 1)
-        ? params->r_size - r_offset
-        : r_slice;
-
-    size_t s_offset = (params->my_nid == 0)
-        ? s_slice * (params->n_nodes - 1)
-        : (params->my_nid - 1) * s_slice;
-    slice_s->tuples = s.tuples + s_offset;
-    slice_s->n_tuples = (params->my_nid == 0)
-        ? params->s_size - s_offset
-        : s_slice;
+    assign_slice(slice_r, &r, params->my_nid, params->n_nodes, 0);
+    assign_slice(slice_s, &s, params->my_nid, params->n_nodes, params->n_nodes - 1);
 }
 
 void release_slices(relation_t *slice_r, relation_t *slice_s) {

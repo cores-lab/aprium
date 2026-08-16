@@ -1,5 +1,4 @@
 #include <fcntl.h>
-#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -14,13 +13,12 @@
  * one       cacheline  (release flag,  coord  -> worker)
  * n_nodes-1 cachelines (arrival flags, worker -> coord)
  */
-struct barrier {
+typedef struct barrier {
     uint64_t flag;
     uint8_t _pad[(CACHELINE_SIZE - sizeof(uint64_t))];
-};
-typedef struct barrier barrier_t;
+} barrier_t;
 
-struct mem {
+typedef struct {
     void *base;
     size_t size;
     size_t my_nid;
@@ -36,10 +34,9 @@ struct mem {
     uint64_t *offs_s;
     tuple_t *remote_tmp_r;
     tuple_t *remote_tmp_s;
-};
-typedef struct mem mem_t;
+} layout_t;
 
-static mem_t mem = { 0 };
+static layout_t layout = { 0 };
 
 typedef struct {
     char const *path;
@@ -48,68 +45,61 @@ typedef struct {
 
 /* Init */
 void *cxl_map(void) {
-    // dax_device_t devices[] = {
-    //     {"/dev/dax0.0", 260650827776ULL},
-    //     {"/dev/dax1.0", 289104986112ULL},
-    //     {"/dev/dax2.0", 274877906944ULL}
-    // };
-
-    // size_t num_devices = sizeof(devices) / sizeof(devices[0]);
-    // size_t total_size = 0;
-
-    // for (size_t i = 0; i < num_devices; i++) {
-    //     total_size += devices[i].size;
-    // }
-
-    // void *base = mmap(NULL, total_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    // BUG_ON(base == MAP_FAILED);
-
-    // size_t offset = 0;
-    // for (size_t i = 0; i < num_devices; i++) {
-    //     int fd = open(devices[i].path, O_RDWR);
-    //     BUG_ON(fd < 0);
-    //     void *target = (uint8_t *)base + offset;
-    //     void *addr = mmap(target, devices[i].size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
-    //     BUG_ON(addr == MAP_FAILED);
-    //     close(fd);
-    //     offset += devices[i].size;
-    // }
-
-    // mem.base = base;
-    // mem.size = total_size;
-
-    // return base;
-
     dax_device_t devices[] = {
-        {"/dev/shm/mock_dax0.0", 64 * (1ULL << 30)},
+        {"/dev/dax0.0", 260650827776ULL},
+        {"/dev/dax1.0", 289104986112ULL},
+        {"/dev/dax2.0", 274877906944ULL}
     };
 
-    int fd = open(devices[0].path, O_RDWR | O_CREAT, 0666);
-    BUG_ON(fd < 0);
-    BUG_ON(ftruncate(fd, devices[0].size) != 0);
+    size_t n_devices = sizeof(devices) / sizeof(devices[0]);
+    size_t total_size = 0;
 
-    void *base = mmap(NULL, devices[0].size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    for (size_t i = 0; i < n_devices; i++) {
+        total_size += devices[i].size;
+    }
+
+    void *base = mmap(NULL, total_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     BUG_ON(base == MAP_FAILED);
 
-    close(fd);
+    size_t offset = 0;
+    for (size_t i = 0; i < n_devices; i++) {
+        int fd = open(devices[i].path, O_RDWR);
+        BUG_ON(fd < 0);
+        void *target = (uint8_t *)base + offset;
+        void *addr = mmap(target, devices[i].size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+        BUG_ON(addr == MAP_FAILED);
+        close(fd);
+        offset += devices[i].size;
+    }
 
-    mem.base = base;
-    mem.size = devices[0].size;
+    layout.base = base;
+    layout.size = total_size;
 
     return base;
+
+    // dax_device_t devices[] = {
+    //     {"/dev/shm/mock_dax0.0", 64 * (1ULL << 30)},
+    // };
+
+    // int fd = open(devices[0].path, O_RDWR | O_CREAT, 0666);
+    // BUG_ON(fd < 0);
+    // BUG_ON(ftruncate(fd, devices[0].size) != 0);
+
+    // void *base = mmap(NULL, devices[0].size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    // BUG_ON(base == MAP_FAILED);
+
+    // close(fd);
+
+    // layout.base = base;
+    // layout.size = devices[0].size;
+
+    // return base;
 }
 
-static size_t tmp_size(size_t n_tuples, size_t n_nodes) {
-    // TODO: this is a pessimistic view (alloc as if one machine does all the work)
-    size_t tmp = round_up(n_tuples * sizeof(tuple_t) + RELATION_PADDING, CACHELINE_SIZE);
-    return tmp * n_nodes;
-}
-
-void cxl_alloc(size_t my_nid, size_t n_nodes, size_t n_threads, size_t r_tuples, size_t s_tuples) {
+void cxl_alloc(size_t r_tuples, size_t s_tuples, size_t n_threads, size_t my_nid, size_t n_nodes) {
     bool const is_coordinator_node = (my_nid == COORDINATION_NODE);
 
     void *base = cxl_map();
-    size_t bytes = 0;
 
     size_t barrier = n_nodes * sizeof(barrier_t);
     size_t r_size = round_up(r_tuples * sizeof(tuple_t), CACHELINE_SIZE);
@@ -117,9 +107,11 @@ void cxl_alloc(size_t my_nid, size_t n_nodes, size_t n_threads, size_t r_tuples,
     size_t thread_hist = round_up(FANOUT_PASS1 * sizeof(uint64_t), CACHELINE_SIZE) * n_threads * n_nodes;
     size_t node_hist = round_up(FANOUT_PASS1 * sizeof(uint64_t), CACHELINE_SIZE) * n_nodes;
     size_t offs = round_up((FANOUT_PASS1 + 1) * sizeof(uint64_t), CACHELINE_SIZE) * n_nodes;
-    size_t tmp_r = tmp_size(r_tuples, n_nodes);
-    size_t tmp_s = tmp_size(s_tuples, n_nodes);
+    size_t padd = FANOUT_PASS1 * (n_nodes * n_threads + 3) * CACHELINE_SIZE;
+    size_t tmp_r = round_up((r_tuples / n_nodes) * sizeof(tuple_t) + padd, CACHELINE_SIZE);
+    size_t tmp_s = round_up(s_tuples * sizeof(tuple_t) + padd, CACHELINE_SIZE);
 
+    size_t bytes = 0;
     bytes += barrier;
     bytes += r_size;
     bytes += s_size;
@@ -129,16 +121,16 @@ void cxl_alloc(size_t my_nid, size_t n_nodes, size_t n_threads, size_t r_tuples,
     bytes += tmp_r;
     bytes += tmp_s;
 
-    BUG_ON(bytes % CACHELINE_SIZE);
-    BUG_ON(bytes > 512ULL * 1024 * 1024 * 1024); /* >512 GiB? */
+    BUG_ON(bytes % CACHELINE_SIZE != 0);
+    BUG_ON(bytes > 384ULL * (1ULL << 30));
 
 #if DEBUG
     printf("Initializing CXL memory (size = %.3lf MiB, addr = %p): ",
-            (double) bytes / 1024.0 / 1024.0, base);
+(double) bytes / 1024.0 / 1024.0, base);
     fflush(stdout);
 #endif
 
-    /* Coordinator zeros out CXL memory, all nodes flush caches */
+    /* Coordinator zeros out CXL memory */
     if (is_coordinator_node) {
         memset(base, 0, bytes);
     }
@@ -146,34 +138,34 @@ void cxl_alloc(size_t my_nid, size_t n_nodes, size_t n_threads, size_t r_tuples,
         sleep(5);
     }
 
-    cache_wb(base, bytes, true);
+    cache_inv(base, bytes, true);
 
     uintptr_t ptr = (uintptr_t)base;
-    mem.barrier = (barrier_t *)(ptr);
+    layout.barrier = (barrier_t *)(ptr);
     ptr += barrier;
-    mem.gen_r = (tuple_t *)ptr;
+    layout.gen_r = (tuple_t *)ptr;
     ptr += r_size;
-    mem.gen_s = (tuple_t *)ptr;
+    layout.gen_s = (tuple_t *)ptr;
     ptr += s_size;
-    mem.thread_hist_r = (uint64_t *)ptr;
+    layout.thread_hist_r = (uint64_t *)ptr;
     ptr += thread_hist;
-    mem.thread_hist_s = (uint64_t *)ptr;
+    layout.thread_hist_s = (uint64_t *)ptr;
     ptr += thread_hist;
-    mem.node_hist_r = (uint64_t *)ptr;
+    layout.node_hist_r = (uint64_t *)ptr;
     ptr += node_hist;
-    mem.node_hist_s = (uint64_t *)ptr;
+    layout.node_hist_s = (uint64_t *)ptr;
     ptr += node_hist;
-    mem.offs_r = (uint64_t *)ptr;
+    layout.offs_r = (uint64_t *)ptr;
     ptr += offs;
-    mem.offs_s = (uint64_t *)ptr;
+    layout.offs_s = (uint64_t *)ptr;
     ptr += offs;
-    mem.remote_tmp_r = (tuple_t *)ptr;
+    layout.remote_tmp_r = (tuple_t *)ptr;
     ptr += tmp_r;
-    mem.remote_tmp_s = (tuple_t *)ptr;
+    layout.remote_tmp_s = (tuple_t *)ptr;
     ptr += tmp_s;
 
-    mem.my_nid = my_nid;
-    mem.n_nodes = n_nodes;
+    layout.my_nid = my_nid;
+    layout.n_nodes = n_nodes;
 
 #if DEBUG
     printf("OK\n");
@@ -182,7 +174,7 @@ void cxl_alloc(size_t my_nid, size_t n_nodes, size_t n_threads, size_t r_tuples,
 }
 
 void cxl_free(void) {
-    int ret = munmap(mem.base, mem.size);
+    int ret = munmap(layout.base, layout.size);
     BUG_ON(ret);
 }
 
@@ -198,26 +190,26 @@ static inline uint64_t load_inval(volatile uint64_t *p) {
 }
 
 static inline void spin(void) {
-    asm volatile("pause" ::: "memory");
+    __asm__ volatile("pause" ::: "memory");
 }
 
 void cxl_barrier(void) {
     static uint64_t gen = 1;
-    if (mem.my_nid == COORDINATION_NODE) {
-        for (size_t i = 0; i < mem.n_nodes; i++) {
+    if (layout.my_nid == COORDINATION_NODE) {
+        for (size_t i = 0; i < layout.n_nodes; i++) {
             if (i == COORDINATION_NODE) {
                 continue;
             }
-            while (load_inval(&mem.barrier[i].flag) != gen) {
+            while (load_inval(&layout.barrier[i].flag) != gen) {
                 spin();
             }
         }
-        store_flush(&mem.barrier[COORDINATION_NODE].flag, gen);
+        store_flush(&layout.barrier[COORDINATION_NODE].flag, gen);
         gen++;
     }
     else {
-        store_flush(&mem.barrier[mem.my_nid].flag, gen);
-        while (load_inval(&mem.barrier[COORDINATION_NODE].flag) != gen) {
+        store_flush(&layout.barrier[layout.my_nid].flag, gen);
+        while (load_inval(&layout.barrier[COORDINATION_NODE].flag) != gen) {
             spin();
         }
         gen++;
@@ -226,42 +218,41 @@ void cxl_barrier(void) {
 
 /* Memory */
 tuple_t *cxl_gen_r(void) {
-    return mem.gen_r;
+    return layout.gen_r;
 }
 
 tuple_t *cxl_gen_s(void) {
-    return mem.gen_s;
+    return layout.gen_s;
 }
 
 uint64_t *cxl_p1_thread_hist_r(void) {
-    return mem.thread_hist_r;
+    return layout.thread_hist_r;
 }
 
 uint64_t *cxl_p1_thread_hist_s(void) {
-    return mem.thread_hist_s;
+    return layout.thread_hist_s;
 }
 
 uint64_t *cxl_p1_node_hist_r(void) {
-    return mem.node_hist_r;
+    return layout.node_hist_r;
 }
 
 uint64_t *cxl_p1_node_hist_s(void) {
-    return mem.node_hist_s;
+    return layout.node_hist_s;
 }
 
 uint64_t *cxl_p1_remote_offs_r(void) {
-    return mem.offs_r;
+    return layout.offs_r;
 }
 
 uint64_t *cxl_p1_remote_offs_s(void) {
-    return mem.offs_s;
+    return layout.offs_s;
 }
 
 tuple_t *cxl_p1_remote_tmp_r(void) {
-    return mem.remote_tmp_r;
+    return layout.remote_tmp_r;
 }
 
 tuple_t *cxl_p1_remote_tmp_s(void) {
-    return mem.remote_tmp_s;
+    return layout.remote_tmp_s;
 }
-

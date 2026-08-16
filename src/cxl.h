@@ -4,7 +4,7 @@
 
 #include "config.h"
 
-void cxl_alloc(size_t my_nid, size_t n_nodes, size_t n_threads, size_t r_tuples, size_t s_tuples);
+void cxl_alloc(size_t r_tuples, size_t s_tuples, size_t n_threads, size_t my_nid, size_t n_nodes);
 void cxl_free(void);
 
 void cxl_barrier(void);

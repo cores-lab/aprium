@@ -1,5 +1,6 @@
 #pragma once
 
+#include <assert.h>
 #include <immintrin.h>
 
 #include "types.h"
@@ -10,7 +11,7 @@
 #define PERF 1
 
 /* Hardware */
-#define N_CPUS 128
+#define N_CPUS 144
 static uint8_t const CPU_MAPPING[] = {
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
     10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
@@ -24,12 +25,34 @@ static uint8_t const CPU_MAPPING[] = {
     90, 91, 92, 93, 94, 95, 96, 97, 98, 99,
     100, 101, 102, 103, 104, 105, 106, 107, 108, 109,
     110, 111, 112, 113, 114, 115, 116, 117, 118, 119,
-    120, 121, 122, 123, 124, 125, 126, 127
+    120, 121, 122, 123, 124, 125, 126, 127, 128, 129,
+    130, 131, 132, 133, 134, 135, 136, 137, 138, 139,
+    140, 141, 142, 143
 };
 static_assert(sizeof(CPU_MAPPING) == sizeof(CPU_MAPPING[0]) * N_CPUS);
+#define N_NUMA_NODES 2
+static uint8_t const NUMA_MAPPING[] = {
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 10
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 20
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 30
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 40
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 50
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 60
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 70
+    0, 0, 1, 1, 1, 1, 1, 1, 1, 1, // 80
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 90
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 100
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 110
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 120
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 130
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 140
+    1, 1, 1, 1
+};
+static_assert(sizeof(CPU_MAPPING) == sizeof(NUMA_MAPPING));
 #define CACHELINE_SIZE 64
 #define L1_CACHE_SIZE 49152
 #define L1_ASSOCIATIVITY 12
+#define PAGE_SIZE 4096
 
 /* Distributed */
 #define COORDINATION_NODE 0
@@ -63,7 +86,7 @@ static_assert(N_RADIX_BITS_PASS1 >= 8);
         if (cond) {                                          \
             fprintf(stderr, "BUG_ON: %s:%d in %s(): `%s`\n", \
                     __FILE__, __LINE__, __func__, #cond);    \
-        abort();                                             \
+            abort();                                         \
         }                                                    \
     } while (0)
 

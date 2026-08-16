@@ -23,18 +23,18 @@ int main(int argc, char **argv) {
     parse_args(argc, argv, &params);
 
     /* Init */
-    cxl_alloc(params.my_nid, params.n_nodes, params.n_threads, params.r_size, params.s_size);
-    mem_alloc(params.r_size, params.s_size, params.n_threads);
+    cxl_alloc(params.r_size, params.s_size, params.n_threads, params.my_nid, params.n_nodes);
+    mem_alloc(params.r_size, params.s_size, params.n_threads, params.n_nodes);
     relation_t slice_r;
     relation_t slice_s;
     uint64_t res;
-    get_slices(&slice_r, &slice_s, &params);
+    accquire_slices(&slice_r, &slice_s, &params);
 
 #if DEBUG
-    printf("Got relation R slice (size = %.3lf MiB, #tuples = %lu)\n",
+    printf("Got build relation R slice (size = %.3lf MiB, #tuples = %lu)\n",
             (double) sizeof(tuple_t) * slice_r.n_tuples / 1024.0 / 1024.0,
             slice_r.n_tuples);
-    printf("Got relation S slice (size = %.3lf MiB, #tuples = %lu)\n",
+    printf("Got probe relation S slice (size = %.3lf MiB, #tuples = %lu)\n",
             (double) sizeof(tuple_t) * slice_s.n_tuples / 1024.0 / 1024.0,
             slice_s.n_tuples);
 #endif

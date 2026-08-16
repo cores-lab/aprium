@@ -10,17 +10,16 @@
 #warning No supported architecture found -- timers will return junk.
 #endif
 
-struct timing {
+typedef struct {
     uint64_t start;
     uint64_t part_distr;
     uint64_t part_assign;
     uint64_t part_local;
     uint64_t build_probe;
     uint64_t end;
-};
-typedef struct timing timing_t;
+} timing_t;
 
-static void print_timing(param_t *params, size_t n_tuples, timing_t *timing)
+static void print_timing(timing_t *timing, param_t *params, size_t n_tuples)
 {
     uint64_t total = timing->end - timing->start;
     uint64_t part_distr = timing->part_distr - timing->start;
@@ -55,7 +54,7 @@ static inline uint64_t cpu_cycle_count() {
 #if defined(__x86_64__)
     uint32_t high;
     uint32_t low;
-    asm volatile ("rdtsc" : "=a" (low), "=d" (high));
+    __asm__ volatile ("rdtsc" : "=a" (low), "=d" (high));
     tick = (uint64_t) high << 32 | low;
 #endif
     return tick;
@@ -72,4 +71,3 @@ static inline void start_timer(uint64_t *t) {
 static inline void stop_timer(uint64_t *t) {
     *t = cpu_cycle_count() - *t;
 }
-

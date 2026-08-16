@@ -5,7 +5,7 @@
 
 #include "config.h"
 
-void mem_alloc(size_t r_tuples, size_t s_tuples, size_t n_threads);
+void mem_alloc(size_t r_tuples, size_t s_tuples, size_t n_threads, size_t n_nodes);
 void mem_free(void);
 
 uint8_t  *mem_p1_part_assign(void);
@@ -15,4 +15,3 @@ tuple_t *mem_p1_local_tmp_r(void);
 tuple_t *mem_p1_local_tmp_s(void);
 void *mem_for(size_t tid, size_t bytes);
 void *mem_reuse_for(size_t tid, size_t bytes);
-

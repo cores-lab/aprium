@@ -1,6 +1,6 @@
 #include <pthread.h>
 #include <sched.h>
-#include <stdbool.h>
+#include <stdalign.h>
 #include <stdio.h>
 #include <string.h>
 #include <x86intrin.h>
@@ -112,7 +112,7 @@ static uint64_t bucket_chaining_join(task_t *task, size_t tid) {
     uint32_t *next = (uint32_t *)(base);
     uint32_t *bucket = (uint32_t *)(base + next_size);
 
-    // We assume exactly one slice per relation in this phase
+    /* We assume exactly one slice per relation in this phase */
     slice_t *slice_r = task->slices_r.head;
     tuple_t *build_tuples = slice_r->tuples;
 
@@ -124,17 +124,19 @@ static uint64_t bucket_chaining_join(task_t *task, size_t tid) {
         bucket[idx] = i + 1;
     }
 
-    /* Probe loop */
     slice_t *slice_s = task->slices_s.head;
-    if (slice_s && slice_s->n_tuples > 0) {
-        tuple_t *probe_tuples = slice_s->tuples;
-        for (size_t i = 0; i < slice_s->n_tuples; i++) {
-            size_t idx = hash(probe_tuples[i].key, mask, N_RADIX_BITS);
-            for (uint32_t hit = bucket[idx]; hit > 0; hit = next[hit - 1]) {
-                // Fetch the key directly from the build tuples slice
-                if (probe_tuples[i].key == build_tuples[hit - 1].key) {
-                    matches++;
-                }
+    if (slice_s->n_tuples == 0) {
+        return 0;
+    }
+    tuple_t *probe_tuples = slice_s->tuples;
+
+    /* Probe loop */
+    for (size_t i = 0; i < slice_s->n_tuples; i++) {
+        size_t idx = hash(probe_tuples[i].key, mask, N_RADIX_BITS);
+        for (uint32_t hit = bucket[idx]; hit > 0; hit = next[hit - 1]) {
+            // Fetch the key directly from the build tuples slice
+            if (probe_tuples[i].key == build_tuples[hit - 1].key) {
+                matches++;
             }
         }
     }
@@ -227,7 +229,7 @@ radix_partition(slice_list_t * restrict in,
                     uint8_t *src = remote_bytes + (i * COMPRESSED_TUPLE_SIZE);
                     size_t idx = hash(*(uint32_t*)src, compressed_mask, compressed_shift);
 
-                    __m128i t_vec = _mm_loadu_si128((const __m128i*)src);
+                    __m128i t_vec = _mm_loadu_si128((__m128i const *)src);
                     t_vec = _mm_slli_si128(t_vec, 1);
                     t_vec = _mm_or_si128(t_vec, cr);
                     _mm_store_si128((__m128i*)&out[dst[idx]], t_vec);
@@ -784,47 +786,32 @@ void *join_worker(void *arg) {
 }
 
 uint64_t join_relations(relation_t *r, relation_t *s, param_t *params) {
-#if DEBUG
-    printf("Distributed mode\n");
-#endif
     uint64_t matches = 0;
 
     /* Threads */
     pthread_t threads[params->n_threads];
-    pthread_attr_t attr;
-    pthread_barrier_t barrier;
-    cpu_set_t set;
     arg_t args[params->n_threads];
+    cpu_set_t set;
+    pthread_barrier_t barrier;
+    BUG_ON(pthread_barrier_init(&barrier, NULL, params->n_threads));
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
 
     /* Histograms */
-    uint64_t *hist_r;
-    uint64_t *hist_s;
+    uint64_t *hist_r = cxl_p1_thread_hist_r();
+    uint64_t *hist_s = cxl_p1_thread_hist_s();
 
-    /* Temporary space for partitioning */
-    tuple_t *tmp_r;
-    tuple_t *tmp_s;
+    /* Partition Buffer */
+    tuple_t *tmp_r = cxl_p1_remote_tmp_r();
+    tuple_t *tmp_s = cxl_p1_remote_tmp_s();
 
     /* Queues for partition and join tasks */
-    task_queue_t *part_queue;
-    task_queue_t *join_queue;
-
-    /* Init */
-    part_queue = task_queue_init(FANOUT_PASS1);
+    task_queue_t *part_queue = task_queue_init(FANOUT_PASS1);
     BUG_ON(!part_queue);
-    join_queue = task_queue_init(1 << N_RADIX_BITS);
+    task_queue_t *join_queue = task_queue_init(1 << N_RADIX_BITS);
     BUG_ON(!join_queue);
     // TODO: use whatever is bigger from above
     slice_allocator_init(FANOUT_PASS1 * params->n_nodes + (1 << N_RADIX_BITS));
-
-    hist_r = cxl_p1_thread_hist_r();
-    hist_s = cxl_p1_thread_hist_s();
-
-    tmp_r = cxl_p1_remote_tmp_r();
-    tmp_s = cxl_p1_remote_tmp_s();
-
-    int err = pthread_barrier_init(&barrier, NULL, params->n_threads);
-    BUG_ON(err);
-    pthread_attr_init(&attr);
 
     /* Assign slices of R & S for each thread */
     size_t r_slice = r->n_tuples / params->n_threads;
@@ -869,9 +856,10 @@ uint64_t join_relations(relation_t *r, relation_t *s, param_t *params) {
         pthread_join(threads[i], NULL);
         matches += args[i].matches;
     }
+    pthread_attr_destroy(&attr);
 
 #if PERF
-    print_timing(params, matches, &args[0].timing);
+    print_timing(&args[0].timing, params, matches);
 #endif
 
     /* Clean-up */
@@ -881,4 +869,3 @@ uint64_t join_relations(relation_t *r, relation_t *s, param_t *params) {
 
     return matches;
 }
-

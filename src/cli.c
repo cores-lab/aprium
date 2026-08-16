@@ -7,8 +7,7 @@
 
 void print_help(char **argv) {
     printf("Usage: %s [options]\n", argv[0]);
-
-        printf(
+    printf(
     "Options:\n"
     " -r, --r-size      Number of tuples in inner relation R [67108864]\n"
     " -s, --s-size      Number of tuples in outer relation S [67108864]\n"
@@ -19,7 +18,7 @@ void print_help(char **argv) {
     " -i, --node-id     ID of this node (must be unique; 0 <= i < n) [0]\n"
     " -h, --help        Show this message\n"
     " -V, --version     Show version\n"
-        );
+    );
 }
 
 void print_version() {
@@ -55,7 +54,7 @@ void parse_args(int argc, char **argv, param_t *params) {
 
     int opt;
     int option_index = 0;
-    const char *optstring = "r:s:uz:t:n:i:hV";
+    char const *optstring = "r:s:uz:t:n:i:hV";
 
     while (1) {
         opt = getopt_long (argc, argv, optstring, long_options, &option_index);
@@ -105,5 +104,7 @@ void parse_args(int argc, char **argv, param_t *params) {
                 break;
         }
     }
-}
 
+    BUG_ON(params->r_size % params->n_nodes != 0);
+    BUG_ON(params->s_size % params->n_nodes != 0);
+}

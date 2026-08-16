@@ -1,4 +1,7 @@
-#include <math.h>
+#include <pthread.h>
+#include <sched.h>
+#include <stdalign.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -6,105 +9,135 @@
 #include "mem.h"
 #include "config.h"
 
-struct allocator {
+typedef struct {
     alignas(CACHELINE_SIZE)
-    uintptr_t cur;
+    atomic_uintptr_t cur;
     uintptr_t end;
-    uint8_t _pad[(CACHELINE_SIZE - (2 * sizeof(uintptr_t)))];
-};
-typedef struct allocator allocator_t;
+    uint8_t *base;
+    uint8_t _pad[(CACHELINE_SIZE - sizeof(uintptr_t) * 2 - sizeof(uint8_t*))];
+} allocator_t;
 
-struct mem {
+typedef struct {
+    alignas(CACHELINE_SIZE)
+    uintptr_t addr;
+    uint8_t _pad[CACHELINE_SIZE - sizeof(uintptr_t)];
+} padded_addr_t;
+
+typedef struct {
     void *base;
-    size_t size;
     size_t n_threads;
     uint8_t  *part_assign;
     uint64_t *local_offs_r;
     uint64_t *local_offs_s;
     tuple_t *local_tmp_r;
     tuple_t *local_tmp_s;
-    allocator_t *alloc; /* one allocator per thread */
-};
-typedef struct mem mem_t;
+    allocator_t allocators[N_NUMA_NODES];
+    padded_addr_t *last_alloc;
+} layout_t;
 
-static mem_t mem = { 0 };
+static layout_t layout = { 0 };
 
-size_t hist_size(size_t fanout) {
-    return round_up(fanout * sizeof(uint64_t), CACHELINE_SIZE);
+static void *touch_worker(void *arg) {
+    allocator_t *alloc = (allocator_t *)arg;
+    memset(alloc->base, 0, alloc->end - (uintptr_t)alloc->base);
+    return NULL;
 }
 
-static size_t tmp_size(size_t n_tuples) {
-    return round_up(n_tuples * sizeof(tuple_t) + RELATION_PADDING, CACHELINE_SIZE);
+static inline int get_cpu_in_numa_node(size_t numa_node) {
+    for (size_t c = 0; c < N_CPUS; c++) {
+        if (NUMA_MAPPING[c] == numa_node) {
+            return c;
+        }
+    }
+    return 0;
 }
 
-void mem_alloc(size_t r_tuples, size_t s_tuples, size_t n_threads) {
+void mem_alloc(size_t r_tuples, size_t s_tuples, size_t n_threads, size_t n_nodes) {
+    layout.n_threads = n_threads;
 
-    /* global */
-    size_t p1_local_offs = hist_size(FANOUT_PASS1 + 1);
-    size_t p1_local_tmp_r = tmp_size(r_tuples);
-    size_t p1_local_tmp_s = tmp_size(s_tuples);
-
+    /* shared */
+    size_t p1_local_offs = round_up((FANOUT_PASS1 + 1) * sizeof(uint64_t), CACHELINE_SIZE);
+    size_t padd = FANOUT_PASS1 * (n_threads + 3) * CACHELINE_SIZE;
+    size_t p1_local_tmp_r = round_up((r_tuples / n_nodes) * sizeof(tuple_t) + padd, CACHELINE_SIZE);
+    size_t p1_local_tmp_s = round_up((s_tuples / n_nodes) * sizeof(tuple_t) + padd, CACHELINE_SIZE);
     size_t p1_part_assign = round_up(FANOUT_PASS1 * sizeof(uint8_t), CACHELINE_SIZE);
+    size_t last_alloc = round_up(n_threads * sizeof(padded_addr_t), CACHELINE_SIZE);
 
-    /* per thread */
-    // TODO: this is a pessimistic view (one thread does all the work)
-    // TODO: here we assume symmetrical relations
-    size_t bigger = r_tuples > s_tuples ? r_tuples : s_tuples;
-    size_t per_thread = 4 * (round_up(2 * sizeof(uint64_t) * FANOUT_PASS1, CACHELINE_SIZE)
-        + round_up(1 * sizeof(uint64_t) * FANOUT_PASS2, CACHELINE_SIZE)
-        + round_up(2 * sizeof(uint64_t) * (FANOUT_PASS2+1), CACHELINE_SIZE)
-        + round_up(4 * 144 * FANOUT_PASS1, CACHELINE_SIZE)
-        + round_up((bigger / n_threads) * sizeof(tuple_t), CACHELINE_SIZE))
-        + round_up(10 * L1_CACHE_SIZE, CACHELINE_SIZE);
-    per_thread = 16 * (1ULL << 30);
+    size_t shared = 0;
+    shared += 2ULL * p1_local_offs;
+    shared += p1_part_assign;
+    shared += p1_local_tmp_r;
+    shared += p1_local_tmp_s;
+    shared += last_alloc;
 
-    /* allocator metadata */
-    size_t meta = round_up(n_threads * sizeof(allocator_t), CACHELINE_SIZE);
+    BUG_ON(shared % CACHELINE_SIZE != 0);
 
-    /* alloc */
-    size_t bytes = 0;
-    bytes += 2ULL * p1_local_offs;
-    bytes += p1_part_assign;
-    bytes += p1_local_tmp_r;
-    bytes += p1_local_tmp_s;
-    bytes += meta;
-    bytes += (per_thread * n_threads);
+    /* per NUMA node */
+    size_t worst = (r_tuples + s_tuples) * sizeof(tuple_t) * 1.5;
+    size_t numa = round_up(worst, CACHELINE_SIZE);
 
-    BUG_ON(bytes % CACHELINE_SIZE);
+    size_t total = shared + numa;
 
 #if DEBUG
     printf("Initializing local memory (size = %.3lf MiB): ",
-            (double) bytes / 1024.0 / 1024.0);
+            (double) total / 1024.0 / 1024.0);
     fflush(stdout);
 #endif
 
-    mem.base = aligned_alloc(CACHELINE_SIZE, bytes);
-    BUG_ON(!mem.base);
-    memset(mem.base, 0, bytes);
-    mem.size = bytes;
+    layout.base = aligned_alloc(CACHELINE_SIZE, shared);
+    BUG_ON(!layout.base);
+    memset(layout.base, 0, shared);
 
-    /* init */
-    uintptr_t ptr = (uintptr_t)mem.base;
-    mem.local_offs_r = (uint64_t *)ptr;
+    uintptr_t ptr = (uintptr_t)layout.base;
+    layout.local_offs_r = (uint64_t *)ptr;
     ptr += p1_local_offs;
-    mem.local_offs_s = (uint64_t *)ptr;
+    layout.local_offs_s = (uint64_t *)ptr;
     ptr += p1_local_offs;
-    mem.part_assign = (uint8_t *)ptr;
+    layout.part_assign = (uint8_t *)ptr;
     ptr += p1_part_assign;
-    mem.local_tmp_r = (tuple_t *)ptr;
+    layout.local_tmp_r = (tuple_t *)ptr;
     ptr += p1_local_tmp_r;
-    mem.local_tmp_s = (tuple_t *)ptr;
+    layout.local_tmp_s = (tuple_t *)ptr;
     ptr += p1_local_tmp_s;
-    mem.alloc = (allocator_t *)ptr;
-    ptr += meta;
+    layout.last_alloc = (padded_addr_t *)ptr;
+    ptr += last_alloc;
 
-    for (size_t i = 0; i < n_threads; i++) {
-        uintptr_t start = ptr + i * per_thread;
-        mem.alloc[i].cur = start;
-        mem.alloc[i].end = start + per_thread;
+    size_t numa_hist[N_NUMA_NODES] = { 0 };
+    for (size_t t = 0; t < n_threads; t++) {
+        size_t n = NUMA_MAPPING[CPU_MAPPING[t]];
+        numa_hist[n]++;
     }
 
-    mem.n_threads = n_threads;
+    pthread_t tids[N_NUMA_NODES];
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    cpu_set_t cpuset;
+
+    for (size_t i = 0; i < N_NUMA_NODES; i++) {
+        if (numa_hist[i] == 0) {
+            continue;
+        }
+
+        size_t pool = round_up((numa * numa_hist[i]) / n_threads, PAGE_SIZE);
+        void *mem = aligned_alloc(PAGE_SIZE, pool);
+        BUG_ON(!mem);
+
+        layout.allocators[i].base = (uint8_t *)mem;
+        atomic_init(&layout.allocators[i].cur, (uintptr_t)mem);
+        layout.allocators[i].end = (uintptr_t)mem + pool;
+
+        CPU_ZERO(&cpuset);
+        CPU_SET(get_cpu_in_numa_node(i), &cpuset);
+        BUG_ON(pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &cpuset) != 0);
+        BUG_ON(pthread_create(&tids[i], &attr, touch_worker, &layout.allocators[i]) != 0);
+    }
+
+    for (size_t i = 0; i < N_NUMA_NODES; i++) {
+        if (numa_hist[i] > 0) {
+            pthread_join(tids[i], NULL);
+        }
+    }
+    pthread_attr_destroy(&attr);
 
 #if DEBUG
     printf("OK\n");
@@ -112,58 +145,59 @@ void mem_alloc(size_t r_tuples, size_t s_tuples, size_t n_threads) {
 }
 
 void mem_free(void) {
-    free(mem.base);
+    if (layout.base) {
+        free(layout.base);
+    }
+    for (size_t i = 0; i < N_NUMA_NODES; ++i) {
+        if (layout.allocators[i].base) {
+            free(layout.allocators[i].base);
+        }
+    }
 }
 
 uint8_t *mem_p1_part_assign(void) {
-    return mem.part_assign;
+    return layout.part_assign;
 }
 
 uint64_t *mem_p1_local_offs_r(void) {
-    return mem.local_offs_r;
+    return layout.local_offs_r;
 }
 
 uint64_t *mem_p1_local_offs_s(void) {
-    return mem.local_offs_s;
+    return layout.local_offs_s;
 }
 
 tuple_t *mem_p1_local_tmp_r(void) {
-    return mem.local_tmp_r;
+    return layout.local_tmp_r;
 }
 
 tuple_t *mem_p1_local_tmp_s(void) {
-    return mem.local_tmp_s;
+    return layout.local_tmp_s;
 }
 
 void *mem_for(size_t tid, size_t bytes) {
-    BUG_ON(!mem.base);
     BUG_ON(!bytes);
-    BUG_ON(tid >= mem.n_threads);
+    BUG_ON(tid >= layout.n_threads);
 
     size_t want = round_up(bytes, CACHELINE_SIZE);
+    size_t numa_node = NUMA_MAPPING[CPU_MAPPING[tid]];
+    allocator_t *alloc = &layout.allocators[numa_node];
 
-    uintptr_t cur = mem.alloc[tid].cur;
-    uintptr_t end = mem.alloc[tid].end;
+    uintptr_t addr = atomic_fetch_add_explicit(&alloc->cur, want, memory_order_relaxed);
 
-    BUG_ON(cur + want > end);
+    BUG_ON(addr + want > alloc->end);
 
-    void *res = (void *)cur;
-    cur += want;
-    mem.alloc[tid].cur = cur;
-
-    return res;
+    layout.last_alloc[tid].addr = addr;
+    return (void *)addr;
 }
 
 void *mem_reuse_for(size_t tid, size_t bytes) {
-    BUG_ON(!mem.base);
     BUG_ON(!bytes);
-    BUG_ON(tid >= mem.n_threads);
+    BUG_ON(tid >= layout.n_threads);
 
-    size_t want = round_up(bytes, CACHELINE_SIZE);
+    // This assumes bytes is smaller than the last allocation.
+    uintptr_t prev_addr = layout.last_alloc[tid].addr;
+    BUG_ON(!prev_addr);
 
-    uintptr_t cur = mem.alloc[tid].cur;
-
-    // TODO: unsafe backwards reach here. check bounds of allocator mem!
-
-    return (void *)(cur - want);
+    return (void *)prev_addr;
 }
