@@ -80,7 +80,7 @@ void parse_args(int argc, char **argv, param_t *params) {
                 break;
             case 't':
                 params->n_threads = atoll(optarg);
-                //BUG_ON(!(params->n_threads >= 2));
+                BUG_ON(!(params->n_threads >= 1));
                 BUG_ON(!(params->n_threads <= N_CPUS));
                 break;
             case 'n':

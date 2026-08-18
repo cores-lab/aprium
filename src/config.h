@@ -7,7 +7,7 @@
 
 /* Program */
 #define VERSION "0.1.1"
-#define DEBUG 1
+#define DEBUG 0
 #define PERF 1
 
 /* Hardware */
@@ -75,12 +75,12 @@ static_assert(N_RADIX_BITS_PASS1 >= 8);
 #define P_TUPLES (P_BYTES / sizeof(tuple_t))
 #define PADDING_TUPLES (P_TUPLES * (FANOUT_PASS2 + 1))
 #define RELATION_PADDING (PADDING_TUPLES * FANOUT_PASS1 * sizeof(tuple_t))
-#define OVERALLOC 2.0
 
 #define UNIFORM 0
 #define ZIPF    1
 
 /* Helper */
+#if DEBUG
 #define BUG_ON(cond)                                         \
     do {                                                     \
         if (cond) {                                          \
@@ -89,6 +89,9 @@ static_assert(N_RADIX_BITS_PASS1 >= 8);
             abort();                                         \
         }                                                    \
     } while (0)
+#else
+#define BUG_ON(cond) do { (void)(cond); } while (0)
+#endif
 
 static inline size_t round_up(size_t s, size_t a) {
     return (s + (a - 1)) & ~(a - 1);

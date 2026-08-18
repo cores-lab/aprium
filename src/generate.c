@@ -83,7 +83,8 @@ void fill_relation_uniform(relation_t *rel, size_t n_threads) {
 
     pthread_t tids[n_threads];
     pthread_attr_t attr;
-    pthread_attr_init(&attr);
+    int err = pthread_attr_init(&attr);
+    BUG_ON(err != 0);
     cpu_set_t set;
     fill_uniform_arg_t args[n_threads];
 
@@ -104,11 +105,15 @@ void fill_relation_uniform(relation_t *rel, size_t n_threads) {
         int cpu = CPU_MAPPING[t];
         CPU_ZERO(&set);
         CPU_SET(cpu, &set);
-        BUG_ON(pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &set));
-        BUG_ON(pthread_create(&tids[t], &attr, fill_worker_uniform, &args[t]));
+        int err = pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &set);
+        BUG_ON(err != 0);
+        err = pthread_create(&tids[t], &attr, fill_worker_uniform, &args[t]);
+        BUG_ON(err != 0);
         pos += len;
     }
 
+    err = pthread_attr_destroy(&attr);
+    BUG_ON(err != 0);
     for (size_t t = 0; t < n_threads; t++) {
         pthread_join(tids[t], NULL);
     }
@@ -144,7 +149,8 @@ void fill_relation_fk_uniform(relation_t *rel, size_t n_threads, size_t r_size) 
 
     pthread_t tids[n_threads];
     pthread_attr_t attr;
-    pthread_attr_init(&attr);
+    int err = pthread_attr_init(&attr);
+    BUG_ON(err != 0);
     cpu_set_t set;
     fill_fk_uniform_arg_t args[n_threads];
 
@@ -164,11 +170,15 @@ void fill_relation_fk_uniform(relation_t *rel, size_t n_threads, size_t r_size) 
         int cpu = CPU_MAPPING[t];
         CPU_ZERO(&set);
         CPU_SET(cpu, &set);
-        BUG_ON(pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &set));
-        BUG_ON(pthread_create(&tids[t], &attr, fill_worker_fk_uniform, &args[t]));
+        int err = pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &set);
+        BUG_ON(err != 0);
+        err = pthread_create(&tids[t], &attr, fill_worker_fk_uniform, &args[t]);
+        BUG_ON(err != 0);
         pos += len;
     }
 
+    err = pthread_attr_destroy(&attr);
+    BUG_ON(err != 0);
     for (size_t t = 0; t < n_threads; t++) {
         pthread_join(tids[t], NULL);
     }
@@ -262,7 +272,8 @@ void fill_relation_fk_zipf(relation_t *rel, size_t n_threads, size_t domain_size
 
     pthread_t tids[n_threads];
     pthread_attr_t attr;
-    pthread_attr_init(&attr);
+    int err = pthread_attr_init(&attr);
+    BUG_ON(err != 0);
     cpu_set_t set;
     fill_zipf_arg_t args[n_threads];
 
@@ -284,11 +295,15 @@ void fill_relation_fk_zipf(relation_t *rel, size_t n_threads, size_t domain_size
         int cpu = CPU_MAPPING[t];
         CPU_ZERO(&set);
         CPU_SET(cpu, &set);
-        BUG_ON(pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &set));
-        BUG_ON(pthread_create(&tids[t], &attr, fill_worker_zipf, &args[t]));
+        int err = pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &set);
+        BUG_ON(err != 0);
+        err = pthread_create(&tids[t], &attr, fill_worker_zipf, &args[t]);
+        BUG_ON(err != 0);
         pos += len;
     }
 
+    err = pthread_attr_destroy(&attr);
+    BUG_ON(err != 0);
     for (size_t t = 0; t < n_threads; t++) {
         pthread_join(tids[t], NULL);
     }
@@ -307,14 +322,15 @@ void load_relation(relation_t *rel, char const *filename) {
     FILE *fp = fopen(filename, "rb");
     BUG_ON(!fp);
 
-    BUG_ON(fseeko(fp, 0, SEEK_END) != 0);
+    int err = fseeko(fp, 0, SEEK_END);
+    BUG_ON(err != 0);
     off_t file_size = ftello(fp);
     BUG_ON(file_size < 0 || (size_t)file_size < rel->n_tuples * sizeof(tuple_t));
 
-    BUG_ON(fseeko(fp, 0, SEEK_SET) != 0);
+    err = fseeko(fp, 0, SEEK_SET);
+    BUG_ON(err != 0);
     size_t got = fread(rel->tuples, sizeof(tuple_t), rel->n_tuples, fp);
     fclose(fp);
-
     BUG_ON(got != rel->n_tuples * sizeof(tuple_t));
 }
 
@@ -339,7 +355,7 @@ static void assign_slice(relation_t *slice, relation_t const *rel,
         my_tuples += tail;
     }
 
-    slice->tuples   = rel->tuples + my_offs;
+    slice->tuples = rel->tuples + my_offs;
     slice->n_tuples = my_tuples;
 }
 

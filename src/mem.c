@@ -14,13 +14,11 @@ typedef struct {
     atomic_uintptr_t cur;
     uintptr_t end;
     uint8_t *base;
-    uint8_t _pad[(CACHELINE_SIZE - sizeof(uintptr_t) * 2 - sizeof(uint8_t*))];
 } allocator_t;
 
 typedef struct {
     alignas(CACHELINE_SIZE)
     uintptr_t addr;
-    uint8_t _pad[CACHELINE_SIZE - sizeof(uintptr_t)];
 } padded_addr_t;
 
 typedef struct {
@@ -76,9 +74,8 @@ void mem_alloc(size_t r_tuples, size_t s_tuples, size_t n_threads, size_t n_node
     size_t worst = (r_tuples + s_tuples) * sizeof(tuple_t) * 1.5;
     size_t numa = round_up(worst, CACHELINE_SIZE);
 
-    size_t total = shared + numa;
-
 #if DEBUG
+    size_t total = shared + numa;
     printf("Initializing local memory (size = %.3lf MiB): ",
             (double) total / 1024.0 / 1024.0);
     fflush(stdout);
@@ -110,7 +107,8 @@ void mem_alloc(size_t r_tuples, size_t s_tuples, size_t n_threads, size_t n_node
 
     pthread_t tids[N_NUMA_NODES];
     pthread_attr_t attr;
-    pthread_attr_init(&attr);
+    int err = pthread_attr_init(&attr);
+    BUG_ON(err != 0);
     cpu_set_t cpuset;
 
     for (size_t i = 0; i < N_NUMA_NODES; i++) {
@@ -128,16 +126,19 @@ void mem_alloc(size_t r_tuples, size_t s_tuples, size_t n_threads, size_t n_node
 
         CPU_ZERO(&cpuset);
         CPU_SET(get_cpu_in_numa_node(i), &cpuset);
-        BUG_ON(pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &cpuset) != 0);
-        BUG_ON(pthread_create(&tids[i], &attr, touch_worker, &layout.allocators[i]) != 0);
+        int err = pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &cpuset);
+        BUG_ON(err != 0);
+        err = pthread_create(&tids[i], &attr, touch_worker, &layout.allocators[i]);
+        BUG_ON(err != 0);
     }
 
+    err = pthread_attr_destroy(&attr);
+    BUG_ON(err != 0);
     for (size_t i = 0; i < N_NUMA_NODES; i++) {
         if (numa_hist[i] > 0) {
             pthread_join(tids[i], NULL);
         }
     }
-    pthread_attr_destroy(&attr);
 
 #if DEBUG
     printf("OK\n");
@@ -145,13 +146,9 @@ void mem_alloc(size_t r_tuples, size_t s_tuples, size_t n_threads, size_t n_node
 }
 
 void mem_free(void) {
-    if (layout.base) {
-        free(layout.base);
-    }
-    for (size_t i = 0; i < N_NUMA_NODES; ++i) {
-        if (layout.allocators[i].base) {
-            free(layout.allocators[i].base);
-        }
+    free(layout.base);
+    for (size_t i = 0; i < N_NUMA_NODES; i++) {
+        free(layout.allocators[i].base);
     }
 }
 

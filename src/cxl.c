@@ -1,4 +1,5 @@
 #include <fcntl.h>
+#include <stdalign.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -14,8 +15,8 @@
  * n_nodes-1 cachelines (arrival flags, worker -> coord)
  */
 typedef struct barrier {
+    alignas(CACHELINE_SIZE)
     uint64_t flag;
-    uint8_t _pad[(CACHELINE_SIZE - sizeof(uint64_t))];
 } barrier_t;
 
 typedef struct {
@@ -83,8 +84,8 @@ void *cxl_map(void) {
 
     // int fd = open(devices[0].path, O_RDWR | O_CREAT, 0666);
     // BUG_ON(fd < 0);
-    // BUG_ON(ftruncate(fd, devices[0].size) != 0);
-
+    // int err = ftruncate(fd, devices[0].size);
+    // BUG_ON(err != 0);
     // void *base = mmap(NULL, devices[0].size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     // BUG_ON(base == MAP_FAILED);
 
