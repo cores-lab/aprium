@@ -464,7 +464,6 @@ static uint64_t *compute_part_offs(parallel_part_arg_t *args) {
             for (size_t t = 0; t < args->n_threads; t++) {
                 size_t idx = (n * args->n_threads + t) * hist_stride + p;
                 uint64_t count = args->thread_hist[idx];
-                // TODO: FIXME: remote partitions should also have PADDING_TUPLES to avoid cache aliasing!
                 size_t bytes = round_up(count * COMPRESSED_TUPLE_SIZE, CACHELINE_SIZE);
 
                 /* If this is my remote contribution, assign my offset */
@@ -528,6 +527,7 @@ static void stream_tuples_to_parts(parallel_part_arg_t *args, uint64_t *offs) {
 
                 __m512i line = _mm512_load_si512((__m512i const *)wc->buf);
                 _mm512_store_si512((__m512i *)dest, line);
+                //_mm512_stream_si512((__m512i *)dest, line);
 
                 wc->write_offs += CACHELINE_SIZE;
                 wc->used -= CACHELINE_SIZE;
@@ -535,6 +535,7 @@ static void stream_tuples_to_parts(parallel_part_arg_t *args, uint64_t *offs) {
                 /* Shift the spill (max 14 bytes) to the front of the buffer */
                 __m128i spill = _mm_load_si128((__m128i const *)&wc->buf[CACHELINE_SIZE]);
                 _mm_store_si128((__m128i *)&wc->buf[0], spill);
+                //_mm_stream_si128((__m128i *)&wc->buf[0], spill);
             }
         }
     }

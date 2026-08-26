@@ -13,7 +13,7 @@ void print_help(char **argv) {
     " -s, --s-size      Number of tuples in outer relation S [67108864]\n"
     " -u, --uniform     Use uniform key distribution\n"
     " -z, --zipf        Use Zipfian key distribution with alpha factor (0.0 <= z <= 1.5) [0.0]\n"
-    " -t, --threads     Number of threads (2 <= t <= nproc) [2]\n"
+    " -t, --threads     Number of threads (t <= nproc) [1]\n"
     " -n, --nodes       Number of nodes (at least 2) [2]\n"
     " -i, --node-id     ID of this node (must be unique; 0 <= i < n) [0]\n"
     " -h, --help        Show this message\n"
@@ -30,7 +30,7 @@ void init_default_params(param_t *params) {
     params->s_size        = 67108864;
     params->fill_mode     = UNIFORM;
     params->zipf_alpha    = 0.0;
-    params->n_threads     = 2;
+    params->n_threads     = 1;
     params->n_nodes       = 2;
     params->my_nid        = 0;
 }
