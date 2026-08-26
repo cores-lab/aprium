@@ -4,7 +4,7 @@ set -euo pipefail
 # ==== CONFIGURATION ===========================================================
 HOST1="10.0.0.1"
 HOST2="10.0.0.2"
-BENCH="./bench/zipf_sweep.py"
+BENCH="${SWEEP:-./bench/radix_sweep.py}"
 ARGS=""
 SNAPSHOT="./src/config.h"
 # ==============================================================================
@@ -30,8 +30,6 @@ if [ ! -f "$BENCH" ]; then
     exit 1
 fi
 cp "$BENCH" "$DIR_SNAPSHOT/"
-
-fi
 
 METADATA="$OUT/metadata.txt"
 echo "==== Benchmark Run Metadata ====" > "$METADATA"
